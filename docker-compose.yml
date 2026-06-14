@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: wikiwar
+      POSTGRES_USER: wikiwar
+      POSTGRES_PASSWORD: wikiwar
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  app:
+    build: .
+    depends_on:
+      - db
+    environment:
+      WIKIWAR_DATABASE_URL: postgresql+psycopg://wikiwar:wikiwar@db:5432/wikiwar
+      WIKIWAR_START_INGEST: "true"
+      WIKIWAR_USER_AGENT: "WikiWar/0.1 (local docker; contact: local@example.invalid) httpx"
+    ports:
+      - "8000:8000"
+
+volumes:
+  postgres_data:
+

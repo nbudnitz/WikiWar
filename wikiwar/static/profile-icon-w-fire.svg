@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title desc" shape-rendering="crispEdges">
+  <title id="title">WikiWar burning book profile icon</title>
+  <desc id="desc">Programmatic 32-bit style Wikipedia W over a burning book, designed for circular profile photos.</desc>
+
+  <defs>
+    <clipPath id="circle-safe">
+      <circle cx="64" cy="64" r="60"/>
+    </clipPath>
+  </defs>
+
+  <rect width="128" height="128" fill="#f6f7f9"/>
+  <circle cx="64" cy="64" r="60" fill="#17202a"/>
+
+  <g clip-path="url(#circle-safe)">
+    <rect x="8" y="8" width="112" height="112" fill="#232b33"/>
+    <rect x="12" y="88" width="104" height="24" fill="#4d4031"/>
+    <rect x="18" y="94" width="92" height="10" fill="#7a5f3d"/>
+    <rect x="26" y="104" width="76" height="8" fill="#382e25"/>
+
+    <rect x="28" y="70" width="36" height="26" fill="#eee2c4"/>
+    <rect x="64" y="70" width="36" height="26" fill="#d9c59a"/>
+    <rect x="30" y="74" width="30" height="4" fill="#b99f6f"/>
+    <rect x="68" y="74" width="28" height="4" fill="#a88c5d"/>
+    <rect x="30" y="84" width="28" height="4" fill="#b99f6f"/>
+    <rect x="70" y="84" width="26" height="4" fill="#a88c5d"/>
+    <rect x="60" y="68" width="8" height="32" fill="#8e7049"/>
+    <rect x="22" y="94" width="84" height="6" fill="#5f4630"/>
+
+    <rect x="18" y="66" width="12" height="30" fill="#7a2f21"/>
+    <rect x="30" y="50" width="12" height="46" fill="#d95b36"/>
+    <rect x="42" y="36" width="12" height="60" fill="#f2a23a"/>
+    <rect x="54" y="18" width="12" height="78" fill="#f6d66f"/>
+    <rect x="66" y="28" width="12" height="68" fill="#fff0cf"/>
+    <rect x="78" y="40" width="12" height="56" fill="#f2a23a"/>
+    <rect x="90" y="54" width="12" height="42" fill="#d95b36"/>
+    <rect x="102" y="70" width="10" height="26" fill="#7a2f21"/>
+
+    <rect x="32" y="72" width="10" height="24" fill="#fff0cf"/>
+    <rect x="44" y="58" width="10" height="38" fill="#f6d66f"/>
+    <rect x="56" y="44" width="10" height="52" fill="#fff0cf"/>
+    <rect x="68" y="54" width="10" height="42" fill="#f6d66f"/>
+    <rect x="80" y="72" width="10" height="24" fill="#fff0cf"/>
+
+    <rect x="50" y="10" width="8" height="18" fill="#d95b36"/>
+    <rect x="58" y="4" width="10" height="28" fill="#f2a23a"/>
+    <rect x="68" y="12" width="8" height="20" fill="#d95b36"/>
+    <rect x="34" y="24" width="8" height="22" fill="#d95b36"/>
+    <rect x="42" y="16" width="8" height="30" fill="#f2a23a"/>
+    <rect x="86" y="24" width="8" height="26" fill="#f2a23a"/>
+    <rect x="94" y="36" width="8" height="20" fill="#d95b36"/>
+
+    <rect x="24" y="38" width="10" height="48" fill="#181818"/>
+    <rect x="34" y="78" width="8" height="12" fill="#181818"/>
+    <rect x="42" y="86" width="8" height="8" fill="#181818"/>
+    <rect x="50" y="82" width="8" height="8" fill="#181818"/>
+    <rect x="54" y="70" width="8" height="12" fill="#181818"/>
+    <rect x="58" y="58" width="12" height="12" fill="#181818"/>
+    <rect x="66" y="70" width="8" height="12" fill="#181818"/>
+    <rect x="70" y="82" width="8" height="8" fill="#181818"/>
+    <rect x="78" y="86" width="8" height="8" fill="#181818"/>
+    <rect x="86" y="78" width="8" height="12" fill="#181818"/>
+    <rect x="94" y="38" width="10" height="48" fill="#181818"/>
+
+    <rect x="30" y="38" width="8" height="8" fill="#333333"/>
+    <rect x="58" y="58" width="12" height="6" fill="#333333"/>
+    <rect x="90" y="38" width="8" height="8" fill="#333333"/>
+    <rect x="42" y="86" width="8" height="4" fill="#333333"/>
+    <rect x="78" y="86" width="8" height="4" fill="#333333"/>
+  </g>
+
+  <circle cx="64" cy="64" r="60" fill="none" stroke="#f6f7f9" stroke-width="4"/>
+</svg>

@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WikiWar</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet" />
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <img class="brand-icon" src="/static/profile-icon.svg" alt="" width="56" height="56" />
+          <div>
+            <h1>WikiWar</h1>
+            <p>Live conflict signals for English Wikipedia article edits</p>
+          </div>
+        </div>
+        <div class="status">
+          <span id="streamState" class="dot"></span>
+          <span id="updatedAt">Connecting</span>
+        </div>
+      </header>
+
+      <nav class="tabs" aria-label="Views">
+        <button class="tab is-active" data-view="live">Live</button>
+        <button class="tab" data-view="scoreboard">Scoreboard</button>
+        <button class="tab" data-view="methodology">Methodology</button>
+      </nav>
+
+      <section id="live" class="view is-active">
+        <div class="grid">
+          <section class="panel table-panel">
+            <div class="panel-heading">
+              <h2>
+                Active Candidates
+                <span class="info-icon" tabindex="0" role="img" aria-label="Active Candidates: pages currently showing enough live conflict signal to rank for review." data-tooltip="Pages currently showing enough live conflict signal to rank for review.">i</span>
+              </h2>
+              <select id="sortLive" aria-label="Sort live candidates">
+                <option value="conflict_score">Score</option>
+                <option value="revert_count">Reverts</option>
+                <option value="human_edit_count">Edits</option>
+                <option value="unique_human_editors">Editors</option>
+              </select>
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th><span class="term">Page <span class="info-icon" tabindex="0" role="img" aria-label="Page: Wikipedia article title being monitored." data-tooltip="Wikipedia article title being monitored.">i</span></span></th>
+                  <th><span class="term">Severity <span class="info-icon" tabindex="0" role="img" aria-label="Severity: label derived from the conflict score: quiet, watch, skirmish, war, or major." data-tooltip="Label derived from the conflict score: quiet, watch, skirmish, war, or major.">i</span></span></th>
+                  <th><span class="term">Score <span class="info-icon" tabindex="0" role="img" aria-label="Score: open-ended conflict score combining velocity, reverts, participants, recency, and cleanup penalties." data-tooltip="Open-ended conflict score combining velocity, reverts, participants, recency, and cleanup penalties.">i</span></span></th>
+                  <th><span class="term">Edits <span class="info-icon" tabindex="0" role="img" aria-label="Edits: non-bot article edits counted in the current 24 hour scoring window." data-tooltip="Non-bot article edits counted in the current 24 hour scoring window.">i</span></span></th>
+                  <th><span class="term">Reverts <span class="info-icon" tabindex="0" role="img" aria-label="Reverts: detected undo, rollback, or revert-like edits in the current window." data-tooltip="Detected undo, rollback, or revert-like edits in the current window.">i</span></span></th>
+                  <th><span class="term">Editors <span class="info-icon" tabindex="0" role="img" aria-label="Editors: unique non-bot editors involved in the current scoring window." data-tooltip="Unique non-bot editors involved in the current scoring window.">i</span></span></th>
+                </tr>
+              </thead>
+              <tbody id="liveRows"></tbody>
+            </table>
+          </section>
+
+          <aside class="panel detail-panel">
+            <div class="panel-heading">
+              <h2 id="detailTitle">Page Detail</h2>
+              <a id="articleLink" href="#" target="_blank" rel="noreferrer">Article</a>
+            </div>
+            <div id="summaryStats" class="stat-grid"></div>
+            <svg id="timeline" viewBox="0 0 640 160" role="img" aria-label="Conflict score timeline"></svg>
+            <div id="links" class="links"></div>
+            <h3>
+              Why flagged
+              <span class="info-icon" tabindex="0" role="img" aria-label="Why flagged: score components that explain why this page is ranked." data-tooltip="Score components that explain why this page is ranked.">i</span>
+            </h3>
+            <dl id="features" class="features"></dl>
+            <h3>Recent edits</h3>
+            <ol id="edits" class="edits"></ol>
+          </aside>
+        </div>
+      </section>
+
+      <section id="scoreboard" class="view">
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>
+              Scoreboard
+            </h2>
+            <select id="scoreboardPeriod" aria-label="Scoreboard period">
+              <optgroup label="Live windows">
+                <option value="live:1">Last hour</option>
+                <option value="live:24" selected>Last 24 hours</option>
+                <option value="live:168">Last 7 days</option>
+              </optgroup>
+              <optgroup id="historicalPeriods" label="Historical snapshots"></optgroup>
+            </select>
+          </div>
+          <table id="scoreboardTable" class="scoreboard-table">
+            <thead>
+              <tr>
+                <th id="scoreboardScoreHeader" class="scoreboard-score-cell">Conflict Score</th>
+                <th class="scoreboard-page-cell">Page</th>
+                <th id="scoreboardMetricA" class="scoreboard-metric-cell">Reverts</th>
+                <th id="scoreboardMetricB" class="scoreboard-participants-cell">Participants</th>
+                <th id="scoreboardMetricC" class="scoreboard-status-cell">Status</th>
+              </tr>
+            </thead>
+            <tbody id="scoreboardRows"></tbody>
+          </table>
+        </section>
+      </section>
+
+      <section id="methodology" class="view">
+        <section class="panel prose">
+          <h2>Methodology</h2>
+          <p>
+            Live data comes from Wikimedia EventStreams. API calls are used only for live enrichment,
+            catch-up, and drill-downs. Historical scoreboards should be produced from downloadable
+            Wikimedia datasets, not multi-year API crawling.
+          </p>
+          <p>
+            Historical controversy scores are evidence-gated. A page needs repeated article-text
+            battles with at least two combatants before it can rank highly; raw revert volume is
+            supporting context, not proof by itself.
+          </p>
+          <p>
+            Battle drill-downs use targeted MediaWiki revision-content diffs. For large historical
+            pages, WikiWar first fetches revision metadata for the selected period, then downloads
+            content for revert-centered revision pairs so the page stays responsive. Talk-page debate
+            matching the contested terms receives a strong boost, while vandalism or graffiti cleanup
+            without battles is penalized.
+          </p>
+        </section>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

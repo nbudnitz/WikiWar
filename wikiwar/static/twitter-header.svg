@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1500 500" role="img" aria-labelledby="title desc" shape-rendering="crispEdges">
+  <title id="title">WikiWar 32-bit style Twitter header</title>
+  <desc id="desc">Pixel-art battlefield with cream-colored tanks facing each other and the WikiWar title.</desc>
+
+  <rect width="1500" height="500" fill="#f6f7f9"/>
+  <rect x="0" y="0" width="1500" height="98" fill="#dfe5eb"/>
+  <rect x="0" y="98" width="1500" height="28" fill="#c8d1da"/>
+  <rect x="0" y="372" width="1500" height="128" fill="#d5c5a1"/>
+  <rect x="0" y="408" width="1500" height="92" fill="#b49a6a"/>
+  <rect x="0" y="456" width="1500" height="44" fill="#7a6b52"/>
+
+  <rect x="92" y="392" width="96" height="16" fill="#947c56"/>
+  <rect x="224" y="430" width="156" height="16" fill="#947c56"/>
+  <rect x="1120" y="390" width="118" height="16" fill="#947c56"/>
+  <rect x="1280" y="438" width="124" height="16" fill="#947c56"/>
+  <rect x="630" y="424" width="250" height="18" fill="#947c56"/>
+
+  <g id="left-tank">
+    <rect x="80" y="322" width="360" height="40" fill="#1d252d"/>
+    <rect x="108" y="300" width="304" height="36" fill="#2d3641"/>
+    <rect x="124" y="252" width="246" height="56" fill="#f1dfbc"/>
+    <rect x="108" y="236" width="278" height="24" fill="#fff0cf"/>
+    <rect x="150" y="220" width="158" height="16" fill="#c5a973"/>
+    <rect x="178" y="172" width="126" height="64" fill="#f1dfbc"/>
+    <rect x="196" y="156" width="92" height="18" fill="#fff0cf"/>
+    <rect x="304" y="184" width="36" height="22" fill="#c5a973"/>
+    <rect x="340" y="174" width="164" height="20" fill="#f1dfbc"/>
+    <rect x="504" y="174" width="46" height="12" fill="#c5a973"/>
+    <rect x="170" y="264" width="146" height="40" fill="#e4cea2"/>
+    <rect x="190" y="264" width="12" height="34" fill="#181818"/>
+    <rect x="202" y="286" width="12" height="12" fill="#181818"/>
+    <rect x="214" y="276" width="12" height="12" fill="#181818"/>
+    <rect x="226" y="286" width="12" height="12" fill="#181818"/>
+    <rect x="238" y="276" width="12" height="12" fill="#181818"/>
+    <rect x="250" y="286" width="12" height="12" fill="#181818"/>
+    <rect x="262" y="264" width="12" height="34" fill="#181818"/>
+    <rect x="112" y="322" width="48" height="48" fill="#68717c"/>
+    <rect x="184" y="322" width="48" height="48" fill="#68717c"/>
+    <rect x="256" y="322" width="48" height="48" fill="#68717c"/>
+    <rect x="328" y="322" width="48" height="48" fill="#68717c"/>
+    <rect x="124" y="334" width="24" height="24" fill="#d8dee5"/>
+    <rect x="196" y="334" width="24" height="24" fill="#d8dee5"/>
+    <rect x="268" y="334" width="24" height="24" fill="#d8dee5"/>
+    <rect x="340" y="334" width="24" height="24" fill="#d8dee5"/>
+    <rect x="96" y="370" width="328" height="16" fill="#0f1419"/>
+    <rect x="52" y="292" width="28" height="48" fill="#c5a973"/>
+    <rect x="398" y="292" width="28" height="48" fill="#c5a973"/>
+  </g>
+
+  <g id="right-tank" transform="translate(1500 0) scale(-1 1)">
+    <rect x="80" y="322" width="360" height="40" fill="#1d252d"/>
+    <rect x="108" y="300" width="304" height="36" fill="#2d3641"/>
+    <rect x="124" y="252" width="246" height="56" fill="#f1dfbc"/>
+    <rect x="108" y="236" width="278" height="24" fill="#fff0cf"/>
+    <rect x="150" y="220" width="158" height="16" fill="#c5a973"/>
+    <rect x="178" y="172" width="126" height="64" fill="#f1dfbc"/>
+    <rect x="196" y="156" width="92" height="18" fill="#fff0cf"/>
+    <rect x="304" y="184" width="36" height="22" fill="#c5a973"/>
+    <rect x="340" y="174" width="164" height="20" fill="#f1dfbc"/>
+    <rect x="504" y="174" width="46" height="12" fill="#c5a973"/>
+    <rect x="170" y="264" width="146" height="40" fill="#e4cea2"/>
+    <rect x="190" y="264" width="12" height="34" fill="#181818"/>
+    <rect x="202" y="286" width="12" height="12" fill="#181818"/>
+    <rect x="214" y="276" width="12" height="12" fill="#181818"/>
+    <rect x="226" y="286" width="12" height="12" fill="#181818"/>
+    <rect x="238" y="276" width="12" height="12" fill="#181818"/>
+    <rect x="250" y="286" width="12" height="12" fill="#181818"/>
+    <rect x="262" y="264" width="12" height="34" fill="#181818"/>
+    <rect x="112" y="322" width="48" height="48" fill="#68717c"/>
+    <rect x="184" y="322" width="48" height="48" fill="#68717c"/>
+    <rect x="256" y="322" width="48" height="48" fill="#68717c"/>
+    <rect x="328" y="322" width="48" height="48" fill="#68717c"/>
+    <rect x="124" y="334" width="24" height="24" fill="#d8dee5"/>
+    <rect x="196" y="334" width="24" height="24" fill="#d8dee5"/>
+    <rect x="268" y="334" width="24" height="24" fill="#d8dee5"/>
+    <rect x="340" y="334" width="24" height="24" fill="#d8dee5"/>
+    <rect x="96" y="370" width="328" height="16" fill="#0f1419"/>
+    <rect x="52" y="292" width="28" height="48" fill="#c5a973"/>
+    <rect x="398" y="292" width="28" height="48" fill="#c5a973"/>
+  </g>
+
+  <rect x="568" y="182" width="52" height="12" fill="#c5a973"/>
+  <rect x="620" y="170" width="24" height="12" fill="#f6d66f"/>
+  <rect x="644" y="158" width="18" height="12" fill="#f2a23a"/>
+  <rect x="662" y="146" width="12" height="12" fill="#d95b36"/>
+  <rect x="922" y="182" width="52" height="12" fill="#c5a973"/>
+  <rect x="898" y="170" width="24" height="12" fill="#f6d66f"/>
+  <rect x="880" y="158" width="18" height="12" fill="#f2a23a"/>
+  <rect x="868" y="146" width="12" height="12" fill="#d95b36"/>
+
+  <rect x="716" y="296" width="20" height="20" fill="#d95b36"/>
+  <rect x="736" y="276" width="28" height="20" fill="#f2a23a"/>
+  <rect x="764" y="296" width="20" height="20" fill="#d95b36"/>
+  <rect x="736" y="316" width="28" height="16" fill="#a64d34"/>
+  <rect x="724" y="258" width="14" height="18" fill="#f6d66f"/>
+  <rect x="762" y="258" width="14" height="18" fill="#f6d66f"/>
+
+  <rect x="486" y="246" width="18" height="8" fill="#17202a"/>
+  <rect x="524" y="230" width="18" height="8" fill="#17202a"/>
+  <rect x="966" y="246" width="18" height="8" fill="#17202a"/>
+  <rect x="928" y="230" width="18" height="8" fill="#17202a"/>
+  <rect x="690" y="382" width="120" height="10" fill="#6d5d45"/>
+  <rect x="676" y="392" width="148" height="10" fill="#4f4638"/>
+</svg>
