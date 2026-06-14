@@ -18,7 +18,10 @@ import httpx
 from .config import settings
 from .controversy import build_local_evidence_payload
 from .historical import (
+    DownloadProgress,
+    open_compressed_dump,
     parse_history_row,
+    pick_preferred_dump_format,
     historical_year_scoreboard,
     rank_historical_rows,
     record_to_aggregate,
@@ -423,26 +426,57 @@ def list_revision_dump_shards(*, snapshot: str, wiki: str = settings.wiki_db) ->
         index_html = response.text
     parser = DumpIndexParser()
     parser.feed(index_html)
-    pattern = re.compile(
+    # Match pages-meta-history shards in any compression format, then prefer the
+    # smallest available (7z is typically an order of magnitude smaller than bz2).
+    candidate_pattern = re.compile(
         rf"^{re.escape(wiki)}-{re.escape(snapshot_id)}-pages-meta-history\d+\.xml-"
-        r"p(?P<start>\d+)p(?P<end>\d+)\.bz2$"
+        r"p(?P<start>\d+)p(?P<end>\d+)"
+    )
+    base_group_pattern = re.compile(
+        rf"^{re.escape(wiki)}-{re.escape(snapshot_id)}-pages-meta-history\d+\.xml-"
+        r"p(?P<start>\d+)p(?P<end>\d+)$"
     )
     seen: set[str] = set()
-    shards: list[RevisionDumpShard] = []
+    all_filenames: list[str] = []
+    page_ids_by_base: dict[str, tuple[int, int]] = {}
     for href in parser.hrefs:
         filename = href.rsplit("/", 1)[-1]
         if filename in seen:
             continue
         seen.add(filename)
-        match = pattern.match(filename)
+        match = candidate_pattern.match(filename)
         if not match:
             continue
+        all_filenames.append(filename)
+        # Strip the compression suffix to get the grouping base name.
+        stripped = filename
+        for suffix in (".7z", ".bz2", ".gz"):
+            if stripped.endswith(suffix):
+                stripped = stripped[: -len(suffix)]
+                break
+        page_ids_by_base[stripped] = (int(match.group("start")), int(match.group("end")))
+    preferred = pick_preferred_dump_format(
+        all_filenames,
+        base_pattern=base_group_pattern,
+        prefer=(".7z", ".bz2", ".gz"),
+    )
+    shards: list[RevisionDumpShard] = []
+    for filename in preferred:
+        stripped = filename
+        for suffix in (".7z", ".bz2", ".gz"):
+            if stripped.endswith(suffix):
+                stripped = stripped[: -len(suffix)]
+                break
+        page_range = page_ids_by_base.get(stripped)
+        if not page_range:
+            continue
+        start_page_id, end_page_id = page_range
         shards.append(
             RevisionDumpShard(
                 filename=filename,
                 url=f"{base_url}{filename}",
-                start_page_id=int(match.group("start")),
-                end_page_id=int(match.group("end")),
+                start_page_id=start_page_id,
+                end_page_id=end_page_id,
             )
         )
     shards.sort(key=lambda shard: (shard.start_page_id, shard.end_page_id, shard.filename))
@@ -499,12 +533,15 @@ def download_revision_dump_shard(
             if total_header and total_header.isdigit():
                 total_bytes = int(total_header) + (resume_from if response.status_code == 206 else 0)
             mode = "ab" if response.status_code == 206 and resume_from else "wb"
-            with partial.open(mode) as file:
+            with partial.open(mode) as file, DownloadProgress(
+                shard.filename, total_bytes=total_bytes or None
+            ) as progress:
                 for chunk in response.iter_bytes(chunk_size=1024 * 1024):
                     if not chunk:
                         continue
                     file.write(chunk)
                     downloaded += len(chunk)
+                    progress.advance(len(chunk))
                     now = time.monotonic()
                     if status_file and status and now - last_status_at >= 5:
                         last_status_at = now
@@ -769,11 +806,8 @@ def local_name(tag: str) -> str:
 
 
 def open_dump_text(path: Path):
-    if path.suffix == ".bz2":
-        return bz2.open(path, "rb")
-    if path.suffix == ".gz":
-        return gzip.open(path, "rb")
-    return path.open("rb")
+    # Defer to the shared opener so .7z (via the 7z binary) is supported alongside gz/bz2.
+    return open_compressed_dump(path)
 
 
 def main() -> None:

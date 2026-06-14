@@ -250,6 +250,7 @@ function historicalDisplayScore(row, method) {
 function historicalMetricHeader(method) {
   if (method === "page-war") return "Signals";
   if (method === "most-discussed") return "Talk";
+  if (method === "governance") return "Governance";
   return "Evidence";
 }
 
@@ -278,6 +279,20 @@ function scoreboardRankingMetricsHtml(row, score) {
         ${rankingMetricHtml("Score", score)}
         ${rankingMetricHtml("Talk bytes", row.talk_text_bytes)}
         ${rankingMetricHtml("Talk edits", row.talk_edit_count)}
+      </div>
+    `;
+  }
+  if (row.ranking_method === "governance") {
+    const admin = Number(row.restriction_count || 0) + Number(row.protection_event_count || 0);
+    const governanceTalk = Number(row.talk_rfc_count || 0)
+      + Number(row.talk_arbitration_count || 0)
+      + Number(row.talk_restriction_count || 0);
+    return `
+      <div class="scoreboard-rank-metrics" aria-label="Historical ranking evidence">
+        ${rankingMetricHtml("Score", score)}
+        ${rankingMetricHtml("RfC", row.talk_rfc_count)}
+        ${rankingMetricHtml("Admin", admin)}
+        ${rankingMetricHtml("Talk", governanceTalk)}
       </div>
     `;
   }
@@ -315,6 +330,12 @@ function formatHistoricalMetric(row, method) {
   }
   if (method === "most-discussed") {
     return `${formatBytes(row.talk_text_bytes)} talk`;
+  }
+  if (method === "governance") {
+    const rfc = Number(row.talk_rfc_count || 0);
+    const arbitration = Number(row.talk_arbitration_count || 0);
+    const restrictions = Number(row.talk_restriction_count || 0) + Number(row.restriction_count || 0);
+    return `${fmt.format(rfc)} RfC, ${fmt.format(arbitration)} arb, ${fmt.format(restrictions)} restr.`;
   }
   return formatEvidence(row);
 }

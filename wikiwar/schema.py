@@ -161,9 +161,49 @@ historical_page_aggregates = Table(
     Column("talk_edit_count", Integer, nullable=False, default=0),
     Column("talk_unique_editors", Integer, nullable=False, default=0),
     Column("talk_text_bytes", Integer, nullable=False, default=0),
+    Column("talk_rfc_count", Integer, nullable=False, default=0),
+    Column("talk_arbitration_count", Integer, nullable=False, default=0),
+    Column("talk_restriction_count", Integer, nullable=False, default=0),
     Column("first_timestamp", DateTime(timezone=True), nullable=True),
     Column("last_timestamp", DateTime(timezone=True), nullable=True),
     UniqueConstraint("period", "wiki", "page_id", name="uq_hist_page_aggregate_period_page"),
+)
+
+
+page_admin_signals = Table(
+    "page_admin_signals",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("wiki", String(64), nullable=False),
+    Column("page_id", Integer, nullable=False),
+    Column("restriction_count", Integer, nullable=False, default=0),
+    Column("restriction_types", Text, nullable=False, default=""),
+    Column("restriction_levels", Text, nullable=False, default=""),
+    Column("has_extendedconfirmed", Boolean, nullable=False, default=False),
+    Column("has_sysop", Boolean, nullable=False, default=False),
+    Column("has_cascade", Boolean, nullable=False, default=False),
+    Column("restriction_expiry", String(64), nullable=False, default=""),
+    Column("protection_event_count", Integer, nullable=False, default=0),
+    Column("protection_days", Float, nullable=False, default=0.0),
+    Column("source", String(128), nullable=False, default=""),
+    Column("imported_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint("wiki", "page_id", name="uq_page_admin_signals_wiki_page"),
+)
+
+
+page_admin_title_signals = Table(
+    "page_admin_title_signals",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("wiki", String(64), nullable=False),
+    Column("page_title", String(1024), nullable=False),
+    Column("protection_event_count", Integer, nullable=False, default=0),
+    Column("protection_days", Float, nullable=False, default=0.0),
+    Column("first_protection_at", DateTime(timezone=True), nullable=True),
+    Column("last_protection_at", DateTime(timezone=True), nullable=True),
+    Column("source", String(128), nullable=False, default=""),
+    Column("imported_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint("wiki", "page_title", name="uq_page_admin_title_signals_wiki_title"),
 )
 
 
@@ -219,6 +259,8 @@ Index("ix_hist_page_period", historical_page_aggregates.c.period, historical_pag
 Index("ix_hist_bucket_period_page", historical_hourly_buckets.c.period, historical_hourly_buckets.c.wiki, historical_hourly_buckets.c.page_id, historical_hourly_buckets.c.bucket_start)
 Index("ix_hist_processed_period", historical_processed_periods.c.period)
 Index("ix_hist_evidence_period_page", historical_evidence_cache.c.period, historical_evidence_cache.c.wiki, historical_evidence_cache.c.page_id)
+Index("ix_page_admin_signals_page", page_admin_signals.c.wiki, page_admin_signals.c.page_id)
+Index("ix_page_admin_title_signals_title", page_admin_title_signals.c.wiki, page_admin_title_signals.c.page_title)
 
 
 def utcnow() -> datetime:
@@ -269,6 +311,9 @@ def migrate_sqlite_schema(bind: Engine) -> None:
         "talk_edit_count": "ALTER TABLE historical_page_aggregates ADD COLUMN talk_edit_count INTEGER NOT NULL DEFAULT 0",
         "talk_unique_editors": "ALTER TABLE historical_page_aggregates ADD COLUMN talk_unique_editors INTEGER NOT NULL DEFAULT 0",
         "talk_text_bytes": "ALTER TABLE historical_page_aggregates ADD COLUMN talk_text_bytes INTEGER NOT NULL DEFAULT 0",
+        "talk_rfc_count": "ALTER TABLE historical_page_aggregates ADD COLUMN talk_rfc_count INTEGER NOT NULL DEFAULT 0",
+        "talk_arbitration_count": "ALTER TABLE historical_page_aggregates ADD COLUMN talk_arbitration_count INTEGER NOT NULL DEFAULT 0",
+        "talk_restriction_count": "ALTER TABLE historical_page_aggregates ADD COLUMN talk_restriction_count INTEGER NOT NULL DEFAULT 0",
     }
     with bind.begin() as connection:
         for column, statement in migrations.items():

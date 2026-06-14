@@ -3,11 +3,13 @@ from __future__ import annotations
 import bz2
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+import gzip
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from wikiwar.historical import (
+    EVENT_COMMENT,
     EVENT_ENTITY,
     EVENT_TIMESTAMP,
     EVENT_TYPE,
@@ -20,27 +22,36 @@ from wikiwar.historical import (
     REVISION_ID,
     REVISION_IS_IDENTITY_REVERT,
     REVISION_IS_IDENTITY_REVERTED,
+    REVISION_TEXT_BYTES,
     WIKI_DB,
     PageHistoricalAggregate,
+    HistoricalRevision,
     aggregate_to_record,
     candidate_row_passes_min_score,
     historical_year_most_discussed_scoreboard,
+    historical_year_governance_scoreboard,
     historical_year_page_war_scoreboard,
     dominant_reverted_user,
     effective_revert_edges,
     parse_history_row,
+    parse_page_restrictions_dump,
+    parse_protection_log_dumps,
     process_history_files,
     probable_revert_only_cleanup_row,
     rank_historical_rows,
     record_to_aggregate,
     routine_update_penalty,
     score_historical_page,
+    talk_governance_counts,
+    pick_preferred_dump_format,
 )
 from wikiwar.repository import (
     historical_month_periods,
     historical_periods,
     historical_year_periods_from_months,
     load_historical_year_aggregates,
+    replace_page_admin_title_signals,
+    replace_page_admin_signals,
     replace_historical_aggregates,
 )
 from wikiwar.schema import metadata
@@ -64,6 +75,34 @@ def test_parse_history_row_skips_bots() -> None:
     row[EVENT_USER_IS_BOT_BY] = "group"
 
     assert parse_history_row(row) is None
+
+
+def test_talk_governance_counts_detects_substantive_dispute_resolution_terms() -> None:
+    assert talk_governance_counts("/* RfC: lead wording */ request for comment") == (1, 0, 0)
+    assert talk_governance_counts("ArbCom case and arbitration enforcement") == (0, 1, 0)
+    assert talk_governance_counts("extended-confirmed page protection under 1RR") == (0, 0, 1)
+    assert talk_governance_counts("Undid revision 123 by Example") == (0, 0, 0)
+
+
+def test_add_talk_revision_excludes_reverted_vandalism_from_text_bytes() -> None:
+    aggregate = PageHistoricalAggregate(wiki="enwiki", page_id=1, page_title="Minimalism")
+    now = datetime.now(timezone.utc)
+
+    def talk_rev(text_bytes: int, reverted: bool) -> HistoricalRevision:
+        return HistoricalRevision(
+            wiki="enwiki", page_id=101, page_title="Talk:Minimalism", timestamp=now,
+            user_text="Spammer", comment="spam", rev_id=1, text_bytes=text_bytes,
+            text_bytes_diff=text_bytes, is_identity_reverted=reverted,
+            first_identity_reverting_revision_id=2 if reverted else None,
+            is_identity_revert=False,
+        )
+
+    aggregate.add_talk_revision(talk_rev(1099, reverted=False))
+    aggregate.add_talk_revision(talk_rev(4_113_797, reverted=True))   # vandalism, later undone
+    aggregate.add_talk_revision(talk_rev(1099, reverted=False))
+
+    assert aggregate.talk_text_bytes == 1099  # spam spike excluded
+    assert aggregate.talk_edit_count == 3     # edit count still reflects all revisions
 
 
 def test_score_historical_page_counts_mutual_reverts() -> None:
@@ -357,6 +396,192 @@ def test_year_methods_rank_page_war_and_discussion(tmp_path) -> None:
     assert most_discussed[0]["page_title"] == "Gaza_war"
 
 
+def test_governance_method_ranks_rfc_arbitration_and_protection_signals(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'governance.db'}", future=True)
+    metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    governed = historical_aggregate_with_activity(
+        page_id=1,
+        title="Israel-Palestine_conflict",
+        edit_count=45,
+        editor_count=12,
+        edge_counts={},
+    )
+    governed.talk_page_id = 101
+    governed.talk_edit_count = 20
+    governed.talk_unique_editor_count = 10
+    governed.talk_text_bytes = 90_000
+    governed.talk_rfc_count = 2
+    governed.talk_arbitration_count = 1
+    governed.talk_restriction_count = 3
+    routine = historical_aggregate_with_activity(
+        page_id=2,
+        title="List_of_example_champions",
+        edit_count=120,
+        editor_count=8,
+        edge_counts={},
+    )
+    routine.raw_reverted_count = 18
+    routine.raw_revert_count = 15
+    governed_record = aggregate_to_record(governed)
+    routine_record = aggregate_to_record(routine)
+    assert governed_record is not None
+    assert routine_record is not None
+
+    with Session() as session:
+        replace_historical_aggregates(session, "history:2026-05:2023-10", [governed_record, routine_record])
+        replace_page_admin_signals(
+            session,
+            "enwiki",
+            [
+                {
+                    "page_id": 1,
+                    "restriction_count": 2,
+                    "restriction_types": "edit, move",
+                    "restriction_levels": "extendedconfirmed, sysop",
+                    "has_extendedconfirmed": True,
+                    "has_sysop": True,
+                    "has_cascade": False,
+                    "restriction_expiry": "infinity",
+                    "source": "test",
+                }
+            ],
+        )
+        replace_page_admin_title_signals(
+            session,
+            "enwiki",
+            [
+                {
+                    "page_title": "Israel-Palestine_conflict",
+                    "protection_event_count": 4,
+                    "protection_days": 120.0,
+                    "first_protection_at": datetime(2023, 10, 1, tzinfo=timezone.utc),
+                    "last_protection_at": datetime(2023, 10, 20, tzinfo=timezone.utc),
+                    "source": "test",
+                }
+            ],
+        )
+
+        rows = historical_year_governance_scoreboard(
+            session,
+            period="history-year:2026-05:2023",
+            limit=2,
+            min_score=0,
+        )
+
+    assert rows[0]["page_title"] == "Israel-Palestine_conflict"
+    assert rows[0]["ranking_method"] == "governance"
+    assert rows[0]["talk_rfc_count"] == 2
+    assert rows[0]["restriction_count"] == 2
+    assert rows[0]["protection_event_count"] == 4
+    assert rows[0]["protection_days"] == 120.0
+    assert rows[0]["has_extendedconfirmed"] is True
+
+
+def test_parse_page_restrictions_dump_groups_current_restrictions(tmp_path) -> None:
+    path = tmp_path / "page_restrictions.sql.gz"
+    content = (
+        "INSERT INTO `page_restrictions` VALUES "
+        "(42,'edit','extendedconfirmed',0,'infinity',1),"
+        "(42,'move','sysop',1,'20270101000000',2),"
+        "(43,'edit','autoconfirmed',0,'20261201000000',3);\n"
+    )
+    with gzip.open(path, "wt", encoding="utf-8") as file:
+        file.write(content)
+
+    signals = parse_page_restrictions_dump(path, source="test-dump")
+
+    first = signals[0]
+    assert first["page_id"] == 42
+    assert first["restriction_count"] == 2
+    assert first["restriction_types"] == "edit, move"
+    assert first["restriction_levels"] == "extendedconfirmed, sysop"
+    assert first["has_extendedconfirmed"] is True
+    assert first["has_sysop"] is True
+    assert first["has_cascade"] is True
+    assert first["restriction_expiry"] == "infinity"
+
+
+def test_parse_protection_log_dumps_counts_title_protection_duration(tmp_path) -> None:
+    path = tmp_path / "pages-logging.xml.gz"
+    content = """<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/">
+  <logitem>
+    <id>1</id>
+    <timestamp>2020-01-01T00:00:00Z</timestamp>
+    <type>protect</type>
+    <action>protect</action>
+    <logtitle>Example page</logtitle>
+    <params xml:space="preserve" />
+  </logitem>
+  <logitem>
+    <id>2</id>
+    <timestamp>2020-01-11T00:00:00Z</timestamp>
+    <type>protect</type>
+    <action>unprotect</action>
+    <logtitle>Example page</logtitle>
+    <params xml:space="preserve" />
+  </logitem>
+  <logitem>
+    <id>3</id>
+    <timestamp>2020-02-01T00:00:00Z</timestamp>
+    <type>delete</type>
+    <action>delete</action>
+    <logtitle>Example page</logtitle>
+    <params xml:space="preserve" />
+  </logitem>
+</mediawiki>
+"""
+    with gzip.open(path, "wt", encoding="utf-8") as file:
+        file.write(content)
+
+    signals = parse_protection_log_dumps(
+        [path],
+        source="test-log",
+        open_until=datetime(2020, 3, 1, tzinfo=timezone.utc),
+    )
+
+    assert signals == [
+        {
+            "page_title": "Example_page",
+            "protection_event_count": 2,
+            "protection_days": 10.0,
+            "first_protection_at": datetime(2020, 1, 1, tzinfo=timezone.utc),
+            "last_protection_at": datetime(2020, 1, 11, tzinfo=timezone.utc),
+            "source": "test-log",
+        }
+    ]
+
+
+def test_pick_preferred_dump_format_prefers_7z_over_bz2_and_gz() -> None:
+    base = "enwiki-20260501-pages-meta-history1.xml-p1p812"
+    available = [
+        f"{base}.bz2",
+        f"{base}.7z",
+        f"{base}.gz",
+        "enwiki-20260501-pages-meta-history1.xml-p813p1624.bz2",  # only bz2
+        "enwiki-20260501-pages-meta-history1.xml-p1625p2436.7z",  # only 7z
+        "enwiki-20260501-pages-meta-history1.xml-p2437p3248.gz",  # only gz
+        "enwiki-20260501-pages-logging1.xml.gz",  # unrelated, should be excluded by base pattern
+    ]
+    pattern = __import__("re").compile(
+        r"^enwiki-20260501-pages-meta-history1\.xml-p\d+p\d+$"
+    )
+    chosen = pick_preferred_dump_format(available, base_pattern=pattern, prefer=(".7z", ".bz2", ".gz"))
+    # The multi-format shard should collapse to the single 7z variant.
+    assert "enwiki-20260501-pages-meta-history1.xml-p1p812.7z" in chosen
+    assert "enwiki-20260501-pages-meta-history1.xml-p1p812.bz2" not in chosen
+    assert "enwiki-20260501-pages-meta-history1.xml-p1p812.gz" not in chosen
+    # Single-format shards are preserved as-is.
+    assert set(chosen) == {
+        "enwiki-20260501-pages-meta-history1.xml-p1p812.7z",
+        "enwiki-20260501-pages-meta-history1.xml-p813p1624.bz2",
+        "enwiki-20260501-pages-meta-history1.xml-p1625p2436.7z",
+        "enwiki-20260501-pages-meta-history1.xml-p2437p3248.gz",
+    }
+    # The unrelated pages-logging file is excluded.
+    assert "enwiki-20260501-pages-logging1.xml.gz" not in chosen
+
+
 def test_process_history_files_reconstructs_revert_edges(tmp_path) -> None:
     path = tmp_path / "sample.tsv.bz2"
     rows = [
@@ -512,6 +737,11 @@ def history_row(
     rev_id: int,
     user: str,
     timestamp: datetime | None = None,
+    page_id: int = 42,
+    page_title: str = "Example",
+    namespace: int = 0,
+    comment: str = "",
+    text_bytes: int = 0,
     is_reverted: bool = False,
     reverting_rev_id: int | None = None,
     is_revert: bool = False,
@@ -524,10 +754,12 @@ def history_row(
         "%Y-%m-%d %H:%M:%S.0"
     )
     row[EVENT_USER_TEXT] = user
-    row[PAGE_ID] = "42"
-    row[PAGE_TITLE] = "Example"
-    row[PAGE_NAMESPACE_HISTORICAL] = "0"
+    row[EVENT_COMMENT] = comment
+    row[PAGE_ID] = str(page_id)
+    row[PAGE_TITLE] = page_title
+    row[PAGE_NAMESPACE_HISTORICAL] = str(namespace)
     row[REVISION_ID] = str(rev_id)
+    row[REVISION_TEXT_BYTES] = str(text_bytes)
     row[REVISION_IS_IDENTITY_REVERTED] = "true" if is_reverted else "false"
     row[REVISION_FIRST_IDENTITY_REVERTING_REVISION_ID] = (
         str(reverting_rev_id) if reverting_rev_id else ""
@@ -554,6 +786,8 @@ def historical_aggregate_with_activity(
                 rev_id=(page_id * 1000) + index,
                 user=users[index % len(users)],
                 timestamp=start + timedelta(seconds=index),
+                page_id=page_id,
+                page_title=title,
             )
         )
         assert revision is not None

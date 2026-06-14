@@ -7,6 +7,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from datetime import timedelta
+import gzip
 from html.parser import HTMLParser
 import math
 from pathlib import Path
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import time
 from typing import Iterable
+import xml.etree.ElementTree as ET
 
 import httpx
 
@@ -24,11 +26,15 @@ from .repository import (
     historical_aggregate_period_exists,
     historical_aggregate_periods,
     historical_processed_period_exists,
+    load_page_admin_signals,
+    load_page_admin_title_signals,
     load_historical_year_page_stats,
     load_historical_year_aggregates,
     load_historical_aggregates,
     mark_historical_period_processed,
     replace_historical_aggregates,
+    replace_page_admin_signals,
+    replace_page_admin_title_signals,
     replace_scoreboard_snapshot,
 )
 from .schema import SessionLocal, init_db
@@ -42,6 +48,7 @@ WIKI_DB = 0
 EVENT_ENTITY = 2
 EVENT_TYPE = 3
 EVENT_TIMESTAMP = 4
+EVENT_COMMENT = 5
 EVENT_USER_TEXT_HISTORICAL = 8
 EVENT_USER_TEXT = 9
 EVENT_USER_IS_BOT_BY_HISTORICAL = 14
@@ -82,6 +89,28 @@ SEASON_TITLE_RE = re.compile(
     r"\b(?:18|19|20)\d{2}(?:[-\u2013]\d{2})?\b.*\b(season|championship|tournament|cup|league|draft|election results)\b",
     re.IGNORECASE,
 )
+TALK_RFC_RE = re.compile(
+    r"\b("
+    r"rfc|rfc/u|request(?:s|ed)? for comment|requested comment|request for comments"
+    r")\b",
+    re.IGNORECASE,
+)
+TALK_ARBITRATION_RE = re.compile(
+    r"\b("
+    r"arbcom|arbitration|arbitration enforcement|wp:ae|ae noticeboard|"
+    r"discretionary sanctions|contentious topic|contentious topics|arbcom case"
+    r")\b",
+    re.IGNORECASE,
+)
+TALK_RESTRICTION_RE = re.compile(
+    r"\b("
+    r"page protection|protected|semi-protected|fully protected|full protection|"
+    r"extended[- ]confirmed|extendedconfirmed|ecp|pending changes|"
+    r"edit restriction|editing restriction|topic ban|1rr|0rr|500/30|"
+    r"move protected|protection request|requested protection"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -91,6 +120,7 @@ class HistoricalRevision:
     page_title: str
     timestamp: datetime
     user_text: str
+    comment: str
     rev_id: int
     text_bytes: int
     text_bytes_diff: int
@@ -132,6 +162,9 @@ class PageHistoricalAggregate:
     talk_editors: set[str] = field(default_factory=set)
     talk_unique_editor_count: int | None = None
     talk_text_bytes: int = 0
+    talk_rfc_count: int = 0
+    talk_arbitration_count: int = 0
+    talk_restriction_count: int = 0
     revert_edges: Counter[tuple[str, str]] = field(default_factory=Counter)
     buckets: dict[datetime, HistoricalBucket] = field(default_factory=dict)
 
@@ -163,7 +196,15 @@ class PageHistoricalAggregate:
         self.talk_edit_count += 1
         self.talk_editors.add(revision.user_text)
         self.talk_unique_editor_count = None
-        self.talk_text_bytes = max(self.talk_text_bytes, max(0, revision.text_bytes))
+        # Exclude identity-reverted revisions so a single vandalism/spam dump
+        # (e.g. 4 MB of link spam that was reverted minutes later) does not
+        # inflate the talk-size proxy used by the "most discussed" ranking.
+        if not revision.is_identity_reverted:
+            self.talk_text_bytes = max(self.talk_text_bytes, max(0, revision.text_bytes))
+        rfc_count, arbitration_count, restriction_count = talk_governance_counts(revision.comment)
+        self.talk_rfc_count += rfc_count
+        self.talk_arbitration_count += arbitration_count
+        self.talk_restriction_count += restriction_count
 
 
 @dataclass(frozen=True)
@@ -474,6 +515,7 @@ def parse_history_row(columns: list[str], namespace: int = 0) -> HistoricalRevis
         page_title=columns[PAGE_TITLE] or columns[PAGE_TITLE_HISTORICAL] or f"page:{page_id}",
         timestamp=timestamp,
         user_text=user_text,
+        comment=columns[EVENT_COMMENT],
         rev_id=rev_id,
         text_bytes=_int(columns[REVISION_TEXT_BYTES]) or 0,
         text_bytes_diff=_int(columns[REVISION_TEXT_BYTES_DIFF]) or 0,
@@ -482,6 +524,29 @@ def parse_history_row(columns: list[str], namespace: int = 0) -> HistoricalRevis
             columns[REVISION_FIRST_IDENTITY_REVERTING_REVISION_ID]
         ),
         is_identity_revert=_bool(columns[REVISION_IS_IDENTITY_REVERT]),
+    )
+
+
+def talk_governance_counts(comment: str) -> tuple[int, int, int]:
+    if not substantive_talk_comment(comment):
+        return (0, 0, 0)
+    return (
+        int(bool(TALK_RFC_RE.search(comment))),
+        int(bool(TALK_ARBITRATION_RE.search(comment))),
+        int(bool(TALK_RESTRICTION_RE.search(comment))),
+    )
+
+
+def substantive_talk_comment(comment: str) -> bool:
+    normalized = comment.strip()
+    if len(normalized) < 3:
+        return False
+    lower = normalized.lower()
+    return not (
+        lower.startswith("reverted edits by")
+        or lower.startswith("undid revision")
+        or lower.startswith("rollback")
+        or lower.startswith("automated")
     )
 
 
@@ -623,6 +688,8 @@ def historical_year_scoreboard(
         return historical_year_page_war_scoreboard(session, period=period, limit=limit, min_score=min_score)
     if method == "most-discussed":
         return historical_year_most_discussed_scoreboard(session, period=period, limit=limit)
+    if method == "governance":
+        return historical_year_governance_scoreboard(session, period=period, limit=limit, min_score=min_score)
 
     candidate_limit = max(limit * 10, 1000)
     aggregates = [
@@ -709,6 +776,58 @@ def historical_year_most_discussed_scoreboard(
     return selected
 
 
+def historical_year_governance_scoreboard(
+    session,
+    *,
+    period: str,
+    limit: int = 100,
+    min_score: float = 40.0,
+) -> list[dict[str, object]]:
+    candidate_limit = max(limit * 100, 5000)
+    records = load_historical_year_page_stats(session, period, candidate_limit, order="governance")
+    admin_signals = load_page_admin_signals(
+        session,
+        [(str(record["wiki"]), int(record["page_id"])) for record in records],
+    )
+    title_signals = load_page_admin_title_signals(
+        session,
+        [
+            (str(record["wiki"]), normalize_history_title(str(record["page_title"])))
+            for record in records
+        ],
+    )
+    rows = [
+        governance_score_row(
+            record,
+            admin_signals.get((str(record["wiki"]), int(record["page_id"]))),
+            title_signals.get((str(record["wiki"]), normalize_history_title(str(record["page_title"])))),
+        )
+        for record in records
+    ]
+    rows = [
+        row
+        for row in rows
+        if float(row["candidate_score"]) >= min_score
+        and int(row["governance_evidence_count"]) > 0
+    ]
+    rows.sort(
+        key=lambda row: (
+            row["candidate_score"],
+            row["governance_evidence_count"],
+            row["talk_text_bytes"],
+            row["raw_reverted_count"] + row["raw_revert_count"],
+        ),
+        reverse=True,
+    )
+    selected = rows[:limit]
+    for rank, row in enumerate(selected, start=1):
+        row["id"] = None
+        row["period"] = period
+        row["rank"] = rank
+        row["ranking_method"] = "governance"
+    return selected
+
+
 def page_war_score_row(record: dict[str, object]) -> dict[str, object]:
     edit_count = int(record.get("edit_count") or 0)
     unique_editors = int(record.get("unique_editors") or 0)
@@ -748,6 +867,105 @@ def page_war_score_row(record: dict[str, object]) -> dict[str, object]:
     }
     row["routine_penalty"] = round(routine_update_penalty(row), 4)
     row["candidate_score"] = round(score * (1.0 - float(row["routine_penalty"])), 2)
+    return row
+
+
+def governance_score_row(
+    record: dict[str, object],
+    admin_signal: dict[str, object] | None = None,
+    title_signal: dict[str, object] | None = None,
+) -> dict[str, object]:
+    admin_signal = admin_signal or {}
+    title_signal = title_signal or {}
+    raw_reverted_count = int(record.get("raw_reverted_count") or 0)
+    raw_revert_count = int(record.get("raw_revert_count") or 0)
+    mutual_reverts = int(record.get("revert_count") or 0)
+    mutual_pairs = int(record.get("mutual_revert_pairs") or 0)
+    talk_edit_count = int(record.get("talk_edit_count") or 0)
+    talk_unique_editors = int(record.get("talk_unique_editors") or 0)
+    talk_text_bytes = int(record.get("talk_text_bytes") or 0)
+    talk_rfc_count = int(record.get("talk_rfc_count") or 0)
+    talk_arbitration_count = int(record.get("talk_arbitration_count") or 0)
+    talk_restriction_count = int(record.get("talk_restriction_count") or 0)
+    restriction_count = int(admin_signal.get("restriction_count") or 0)
+    protection_event_count = (
+        int(admin_signal.get("protection_event_count") or 0)
+        + int(title_signal.get("protection_event_count") or 0)
+    )
+    protection_days = (
+        float(admin_signal.get("protection_days") or 0.0)
+        + float(title_signal.get("protection_days") or 0.0)
+    )
+    has_extendedconfirmed = bool(admin_signal.get("has_extendedconfirmed"))
+    has_sysop = bool(admin_signal.get("has_sysop"))
+    has_cascade = bool(admin_signal.get("has_cascade"))
+
+    debate_score = (
+        talk_rfc_count * 90.0
+        + talk_arbitration_count * 120.0
+        + talk_restriction_count * 70.0
+        + min(110.0, math.sqrt(max(0, talk_edit_count)) * 10.0)
+        + min(95.0, math.log1p(max(0, talk_text_bytes)) * 6.0)
+        + min(45.0, math.sqrt(max(0, talk_unique_editors)) * 4.0)
+    )
+    protection_score = (
+        restriction_count * 70.0
+        + (130.0 if has_sysop else 0.0)
+        + (100.0 if has_extendedconfirmed else 0.0)
+        + (35.0 if has_cascade else 0.0)
+        + min(180.0, protection_event_count * 18.0)
+        + min(160.0, math.sqrt(max(0.0, protection_days)) * 9.0)
+    )
+    article_score = (
+        min(180.0, math.sqrt(max(0, raw_reverted_count + raw_revert_count)) * 17.0)
+        + min(90.0, math.sqrt(max(0, mutual_reverts)) * 11.0)
+        + min(80.0, mutual_pairs * 12.0)
+    )
+    governance_evidence_count = (
+        talk_rfc_count
+        + talk_arbitration_count
+        + talk_restriction_count
+        + restriction_count
+        + protection_event_count
+    )
+    score = debate_score + protection_score + article_score
+    row = {
+        **record,
+        "peak_score": round(score, 2),
+        "candidate_score": round(score, 2),
+        "score_area": 0.0,
+        "war_minutes": 0,
+        "episode_count": 0,
+        "raw_reverted_count": raw_reverted_count,
+        "raw_revert_count": raw_revert_count,
+        "revert_count": mutual_reverts,
+        "mutual_revert_pairs": mutual_pairs,
+        "talk_edit_count": talk_edit_count,
+        "talk_unique_editors": talk_unique_editors,
+        "talk_text_bytes": talk_text_bytes,
+        "talk_rfc_count": talk_rfc_count,
+        "talk_arbitration_count": talk_arbitration_count,
+        "talk_restriction_count": talk_restriction_count,
+        "restriction_count": restriction_count,
+        "restriction_types": str(admin_signal.get("restriction_types") or ""),
+        "restriction_levels": str(admin_signal.get("restriction_levels") or ""),
+        "restriction_expiry": str(admin_signal.get("restriction_expiry") or ""),
+        "has_extendedconfirmed": has_extendedconfirmed,
+        "has_sysop": has_sysop,
+        "has_cascade": has_cascade,
+        "protection_event_count": protection_event_count,
+        "protection_days": round(protection_days, 2),
+        "first_protection_at": title_signal.get("first_protection_at"),
+        "last_protection_at": title_signal.get("last_protection_at"),
+        "governance_evidence_count": governance_evidence_count,
+        "battle_count": None,
+        "talk_evidence_count": talk_rfc_count + talk_arbitration_count + talk_restriction_count,
+    }
+    routine_penalty = routine_update_penalty(row)
+    if governance_evidence_count:
+        routine_penalty *= 0.35
+    row["routine_penalty"] = round(routine_penalty, 4)
+    row["candidate_score"] = round(score * (1.0 - routine_penalty), 2)
     return row
 
 
@@ -833,6 +1051,9 @@ def aggregate_to_record(aggregate: PageHistoricalAggregate) -> dict[str, object]
         mutual_revert_pairs=mutual_pairs,
         talk_edit_count=aggregate.talk_edit_count,
         talk_text_bytes=aggregate.talk_text_bytes,
+        talk_rfc_count=aggregate.talk_rfc_count,
+        talk_arbitration_count=aggregate.talk_arbitration_count,
+        talk_restriction_count=aggregate.talk_restriction_count,
     ):
         return None
     return {
@@ -849,6 +1070,9 @@ def aggregate_to_record(aggregate: PageHistoricalAggregate) -> dict[str, object]
         "talk_edit_count": aggregate.talk_edit_count,
         "talk_unique_editors": len(aggregate.talk_editors),
         "talk_text_bytes": aggregate.talk_text_bytes,
+        "talk_rfc_count": aggregate.talk_rfc_count,
+        "talk_arbitration_count": aggregate.talk_arbitration_count,
+        "talk_restriction_count": aggregate.talk_restriction_count,
         "first_timestamp": aggregate.first_timestamp,
         "last_timestamp": aggregate.last_timestamp,
         "buckets": [
@@ -876,8 +1100,12 @@ def should_store_historical_aggregate(
     mutual_revert_pairs: int,
     talk_edit_count: int,
     talk_text_bytes: int,
+    talk_rfc_count: int = 0,
+    talk_arbitration_count: int = 0,
+    talk_restriction_count: int = 0,
 ) -> bool:
     raw_revert_activity = raw_reverted_count + raw_revert_count
+    governance_mentions = talk_rfc_count + talk_arbitration_count + talk_restriction_count
     if mutual_revert_count > 0 or mutual_revert_pairs > 0:
         return True
     if raw_reverted_count >= 3 or raw_revert_count >= 3:
@@ -885,6 +1113,8 @@ def should_store_historical_aggregate(
     if edit_count >= 40 and unique_editors >= 8 and raw_revert_activity >= 2:
         return True
     if talk_edit_count >= 3 or talk_text_bytes >= 12_000:
+        return True
+    if governance_mentions > 0:
         return True
     return False
 
@@ -904,6 +1134,9 @@ def record_to_aggregate(record: dict[str, object]) -> PageHistoricalAggregate:
         talk_edit_count=int(record.get("talk_edit_count") or 0),
         talk_unique_editor_count=int(record.get("talk_unique_editors") or 0),
         talk_text_bytes=int(record.get("talk_text_bytes") or 0),
+        talk_rfc_count=int(record.get("talk_rfc_count") or 0),
+        talk_arbitration_count=int(record.get("talk_arbitration_count") or 0),
+        talk_restriction_count=int(record.get("talk_restriction_count") or 0),
     )
     for bucket_record in record.get("buckets", []):  # type: ignore[union-attr]
         bucket = HistoricalBucket(
@@ -996,6 +1229,9 @@ def score_historical_page(aggregate: PageHistoricalAggregate) -> dict[str, objec
             else len(aggregate.talk_editors)
         ),
         "talk_text_bytes": aggregate.talk_text_bytes,
+        "talk_rfc_count": aggregate.talk_rfc_count,
+        "talk_arbitration_count": aggregate.talk_arbitration_count,
+        "talk_restriction_count": aggregate.talk_restriction_count,
         "revert_density": round(revert_density, 4),
         "top_reverter_share": round(top_reverter_share, 4),
         "strongest_pair_share": round(strongest_pair_share, 4),
@@ -1252,6 +1488,584 @@ def _timestamp(value: str) -> datetime | None:
         return None
 
 
+def current_dump_url(snapshot: str, wiki: str, dump_name: str) -> str:
+    return f"https://dumps.wikimedia.org/{wiki}/{snapshot}/{wiki}-{snapshot}-{dump_name}.sql.gz"
+
+
+def current_dump_file_url(snapshot: str, wiki: str, filename: str) -> str:
+    return f"https://dumps.wikimedia.org/{wiki}/{snapshot}/{filename}"
+
+
+def list_current_dump_filenames(snapshot: str, wiki: str, pattern: re.Pattern[str]) -> list[str]:
+    url = f"https://dumps.wikimedia.org/{wiki}/{snapshot}/"
+    with httpx.Client(headers={"User-Agent": settings.user_agent}, timeout=30.0, follow_redirects=True) as client:
+        response = client.get(url)
+        response.raise_for_status()
+    parser = LinkParser()
+    parser.feed(response.text)
+    # Wikimedia dump indexes emit absolute-path hrefs (e.g. "/enwiki/20260501/..."),
+    # so normalize to basenames before matching against the supplied filename pattern.
+    filenames = sorted({href.rsplit("/", 1)[-1] for href in parser.hrefs if pattern.match(href.rsplit("/", 1)[-1])})
+    return filenames
+
+
+DUMP_FORMAT_SUFFIXES = (".7z", ".bz2", ".gz")
+
+
+def pick_preferred_dump_format(
+    available_filenames: list[str],
+    *,
+    base_pattern: re.Pattern[str],
+    prefer: tuple[str, ...] = (".7z", ".bz2", ".gz"),
+) -> list[str]:
+    """Group candidate dump filenames by their compression-stripped base name and,
+    for each group, keep only the most preferred format that is present.
+
+    Wikimedia ships the same logical dump in multiple compression formats
+    (e.g. pages-meta-history.xml is offered as both .7z and .bz2). The 7z
+    variant is typically an order of magnitude smaller, so prefer it to save
+    bandwidth and disk. ``prefer`` lists formats from most to least preferred.
+    """
+    by_base: dict[str, list[str]] = defaultdict(list)
+    for filename in available_filenames:
+        stripped = filename
+        for suffix in DUMP_FORMAT_SUFFIXES:
+            if stripped.endswith(suffix):
+                stripped = stripped[: -len(suffix)]
+                break
+        if not base_pattern.match(stripped):
+            continue
+        by_base[stripped].append(filename)
+    selected: list[str] = []
+    for base, candidates in sorted(by_base.items()):
+        if len(candidates) == 1:
+            selected.append(candidates[0])
+            continue
+        for preferred_suffix in prefer:
+            match = next((name for name in candidates if name.endswith(preferred_suffix)), None)
+            if match:
+                selected.append(match)
+                break
+        else:
+            selected.extend(candidates)
+    return sorted(selected)
+
+
+def open_compressed_dump(path: Path):
+    """Open a Wikimedia dump for byte-stream reading, transparently handling
+    .gz, .bz2, and .7z. The .7z path shells out to the ``7z`` binary because
+    Python has no stdlib 7z support; a clear error is raised if it is missing.
+    """
+    suffix = "".join(path.suffixes[-1:])
+    if suffix == ".gz":
+        return gzip.open(path, "rb")
+    if suffix == ".bz2":
+        return bz2.open(path, "rb")
+    if suffix == ".7z":
+        binary = next((name for name in ("7z", "7za", "7zr", "p7zip") if shutil.which(name)), None)
+        if not binary:
+            raise RuntimeError(
+                "Decompressing .7z dumps requires the '7z' binary (install p7zip-full / "
+                "'brew install p7zip'). Falling back is not possible for 7z. File: " + str(path)
+            )
+        proc = subprocess.Popen(
+            [binary, "x", "-so", str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        return proc.stdout  # type: ignore[return-value]
+    return path.open("rb")
+
+
+def _human_bytes(value: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or unit == "TiB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024.0
+    return f"{value:.1f} TiB"
+
+
+def _terminal_width(default: int = 80) -> int:
+    try:
+        import shutil as _shutil
+
+        return _shutil.get_terminal_size((default, 24)).columns
+    except Exception:
+        return default
+
+
+class DownloadProgress:
+    """Carriage-return progress bar written to stderr. Works in non-TTY contexts
+    by emitting one throttled status line per update interval instead of rewriting."""
+
+    def __init__(self, label: str, *, total_bytes: int | None = None, update_interval: float = 0.5) -> None:
+        self.label = label
+        self.total_bytes = total_bytes
+        self.update_interval = update_interval
+        self.downloaded = 0
+        self._last_update = 0.0
+        self._started = 0.0
+        self._is_tty = sys.stderr.isatty()
+
+    def __enter__(self) -> "DownloadProgress":
+        import time as _time
+
+        self._started = _time.monotonic()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        import time as _time
+
+        elapsed = _time.monotonic() - self._started
+        if exc_type is None:
+            self._render(final=True)
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+        if exc_type is None:
+            log(
+                f"download_progress_done label={self.label} "
+                f"bytes={self.downloaded} elapsed_seconds={elapsed:.1f}"
+            )
+
+    def advance(self, chunk_bytes: int) -> None:
+        import time as _time
+
+        self.downloaded += chunk_bytes
+        now = _time.monotonic()
+        if now - self._last_update < self.update_interval and self.downloaded != self.total_bytes:
+            return
+        self._last_update = now
+        self._render()
+
+    def _render(self, *, final: bool = False) -> None:
+        import time as _time
+
+        elapsed = max(1e-6, _time.monotonic() - self._started)
+        rate = self.downloaded / elapsed
+        width = _terminal_width()
+        label = self.label
+        if len(label) > 32:
+            label = label[:29] + "..."
+        downloaded_h = _human_bytes(self.downloaded)
+        if self.total_bytes and self.total_bytes > 0:
+            pct = min(1.0, self.downloaded / self.total_bytes)
+            total_h = _human_bytes(self.total_bytes)
+            eta_seconds = (self.total_bytes - self.downloaded) / rate if rate > 0 else 0
+            eta_h = _format_duration(eta_seconds)
+            rate_h = _human_bytes(rate) + "/s"
+            pct_str = f"{pct * 100:5.1f}%"
+            right = f" {pct_str}  {downloaded_h} / {total_h}  {rate_h}  ETA {eta_h}"
+            bar_budget = max(0, width - len(label) - len(right) - 4)
+            filled = int(bar_budget * pct)
+            bar = "[" + "#" * filled + ">" + "-" * max(0, bar_budget - filled - 1) + "]"
+            line = f"{label} {bar}{right}"
+        else:
+            rate_h = _human_bytes(rate) + "/s"
+            right = f" {downloaded_h}  {rate_h}"
+            line = f"{label}{right}"
+        line = line[:width]
+        if self._is_tty:
+            sys.stderr.write("\r" + line + " ")
+        else:
+            sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+
+def _remote_content_length(url: str) -> int | None:
+    try:
+        with httpx.Client(
+            headers={"User-Agent": settings.user_agent}, timeout=30.0, follow_redirects=True
+        ) as client:
+            head = client.head(url)
+            head.raise_for_status()
+            value = head.headers.get("Content-Length")
+            return int(value) if value and value.isdigit() else None
+    except Exception:
+        return None
+
+
+def download_current_dump_file(
+    *,
+    snapshot: str,
+    wiki: str,
+    filename: str,
+    output_dir: Path,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    target = output_dir / filename
+    if target.exists() and target.stat().st_size > 0:
+        return target
+    partial = target.with_suffix(target.suffix + ".part")
+    url = current_dump_file_url(snapshot, wiki, filename)
+    log(f"download_start url={url} target={target}")
+    total = _remote_content_length(url)
+    with httpx.stream(
+        "GET",
+        url,
+        headers={"User-Agent": settings.user_agent},
+        timeout=60.0,
+        follow_redirects=True,
+    ) as response:
+        response.raise_for_status()
+        if total is None:
+            header_total = response.headers.get("Content-Length")
+            total = int(header_total) if header_total and header_total.isdigit() else None
+        with partial.open("wb") as file, DownloadProgress(filename, total_bytes=total) as progress:
+            for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                file.write(chunk)
+                progress.advance(len(chunk))
+    partial.replace(target)
+    log(f"download_done target={target} bytes={target.stat().st_size}")
+    return target
+
+
+def download_current_sql_dump(
+    *,
+    snapshot: str,
+    wiki: str,
+    dump_name: str,
+    output_dir: Path,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    target = output_dir / f"{wiki}-{snapshot}-{dump_name}.sql.gz"
+    if target.exists() and target.stat().st_size > 0:
+        return target
+    partial = target.with_suffix(target.suffix + ".part")
+    url = current_dump_url(snapshot, wiki, dump_name)
+    log(f"download_start url={url} target={target}")
+    total = _remote_content_length(url)
+    with httpx.stream(
+        "GET",
+        url,
+        headers={"User-Agent": settings.user_agent},
+        timeout=60.0,
+        follow_redirects=True,
+    ) as response:
+        response.raise_for_status()
+        if total is None:
+            header_total = response.headers.get("Content-Length")
+            total = int(header_total) if header_total and header_total.isdigit() else None
+        with partial.open("wb") as file, DownloadProgress(target.name, total_bytes=total) as progress:
+            for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                file.write(chunk)
+                progress.advance(len(chunk))
+    partial.replace(target)
+    log(f"download_done target={target} bytes={target.stat().st_size}")
+    return target
+
+
+def import_page_restrictions_dump(
+    *,
+    path: Path,
+    wiki: str,
+    source: str,
+) -> int:
+    signals = parse_page_restrictions_dump(path, source=source)
+    init_db()
+    with SessionLocal() as session:
+        replace_page_admin_signals(session, wiki, signals)
+    return len(signals)
+
+
+def import_protection_log_dumps(
+    *,
+    paths: list[Path],
+    wiki: str,
+    source: str,
+    open_until: datetime | None = None,
+    status_file: Path | None = None,
+) -> int:
+    signals = parse_protection_log_dumps(
+        paths,
+        source=source,
+        open_until=open_until or datetime.now(timezone.utc),
+        status_file=status_file,
+    )
+    init_db()
+    with SessionLocal() as session:
+        replace_page_admin_title_signals(session, wiki, signals)
+    return len(signals)
+
+
+def parse_page_restrictions_dump(path: Path, *, source: str = "") -> list[dict[str, object]]:
+    signal_map: dict[int, dict[str, object]] = {}
+    for row in iter_mysql_insert_rows(path, "page_restrictions"):
+        if len(row) < 6:
+            continue
+        page_id = _int(str(row[0] or ""))
+        if not page_id:
+            continue
+        restriction_type = str(row[1] or "")
+        restriction_level = str(row[2] or "")
+        cascade = str(row[3] or "") == "1"
+        expiry = str(row[4] or "")
+        signal = signal_map.setdefault(
+            page_id,
+            {
+                "page_id": page_id,
+                "restriction_count": 0,
+                "restriction_types_set": set(),
+                "restriction_levels_set": set(),
+                "has_extendedconfirmed": False,
+                "has_sysop": False,
+                "has_cascade": False,
+                "restriction_expiry": "",
+                "protection_event_count": 0,
+                "protection_days": 0.0,
+                "source": source,
+            },
+        )
+        signal["restriction_count"] = int(signal["restriction_count"]) + 1
+        signal["restriction_types_set"].add(restriction_type)  # type: ignore[union-attr]
+        signal["restriction_levels_set"].add(restriction_level)  # type: ignore[union-attr]
+        normalized_level = restriction_level.lower().replace("-", "")
+        signal["has_extendedconfirmed"] = bool(signal["has_extendedconfirmed"]) or normalized_level == "extendedconfirmed"
+        signal["has_sysop"] = bool(signal["has_sysop"]) or normalized_level == "sysop"
+        signal["has_cascade"] = bool(signal["has_cascade"]) or cascade
+        signal["restriction_expiry"] = max_restriction_expiry(str(signal["restriction_expiry"]), expiry)
+
+    signals: list[dict[str, object]] = []
+    for signal in signal_map.values():
+        types = sorted(str(value) for value in signal.pop("restriction_types_set"))  # type: ignore[arg-type]
+        levels = sorted(str(value) for value in signal.pop("restriction_levels_set"))  # type: ignore[arg-type]
+        signal["restriction_types"] = ", ".join(types)
+        signal["restriction_levels"] = ", ".join(levels)
+        signals.append(signal)
+    return sorted(signals, key=lambda item: int(item["page_id"]))
+
+
+def parse_protection_log_dumps(
+    paths: list[Path],
+    *,
+    source: str = "",
+    open_until: datetime,
+    status_file: Path | None = None,
+) -> list[dict[str, object]]:
+    events_by_title: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
+    events_seen = 0
+    for index, path in enumerate(paths, start=1):
+        if status_file:
+            status_file.parent.mkdir(parents=True, exist_ok=True)
+            status_file.write_text(
+                f"{datetime.now(timezone.utc).isoformat()} parsing {index}/{len(paths)} {path} "
+                f"events={events_seen} titles={len(events_by_title)}\n",
+                encoding="utf-8",
+            )
+        for event in iter_protection_log_events(path):
+            title = normalize_history_title(event["page_title"])
+            if not title or ":" in title:
+                continue
+            events_by_title[title].append((event["timestamp"], event["action"]))  # type: ignore[arg-type]
+            events_seen += 1
+    signals = [
+        protection_events_to_signal(title, events, source=source, open_until=open_until)
+        for title, events in events_by_title.items()
+    ]
+    signals = [signal for signal in signals if int(signal["protection_event_count"]) > 0]
+    if status_file:
+        status_file.write_text(
+            f"{datetime.now(timezone.utc).isoformat()} complete files={len(paths)} "
+            f"events={events_seen} titles={len(signals)}\n",
+            encoding="utf-8",
+        )
+    return sorted(signals, key=lambda item: str(item["page_title"]))
+
+
+def iter_protection_log_events(path: Path) -> Iterable[dict[str, object]]:
+    with open_compressed_dump(path) as file:
+        for _, element in ET.iterparse(file, events=("end",)):
+            if xml_local_name(element.tag) != "logitem":
+                continue
+            log_type = xml_child_text(element, "type")
+            if log_type != "protect":
+                element.clear()
+                continue
+            timestamp = parse_log_timestamp(xml_child_text(element, "timestamp"))
+            title = xml_child_text(element, "logtitle")
+            action = xml_child_text(element, "action")
+            if timestamp and title and action:
+                yield {
+                    "timestamp": timestamp,
+                    "page_title": title,
+                    "action": action,
+                }
+            element.clear()
+
+
+def protection_events_to_signal(
+    title: str,
+    events: list[tuple[datetime, str]],
+    *,
+    source: str,
+    open_until: datetime,
+) -> dict[str, object]:
+    sorted_events = sorted(events, key=lambda item: item[0])
+    active_start: datetime | None = None
+    protected_seconds = 0.0
+    first_protection_at: datetime | None = None
+    last_protection_at: datetime | None = None
+    protection_event_count = 0
+    for timestamp, action in sorted_events:
+        if action in {"protect", "modify", "move_prot"}:
+            protection_event_count += 1
+            first_protection_at = first_protection_at or timestamp
+            last_protection_at = timestamp
+            if active_start is None:
+                active_start = timestamp
+        elif action == "unprotect":
+            protection_event_count += 1
+            last_protection_at = timestamp
+            if active_start is not None and timestamp > active_start:
+                protected_seconds += (timestamp - active_start).total_seconds()
+                active_start = None
+    if active_start is not None and open_until > active_start:
+        protected_seconds += (open_until - active_start).total_seconds()
+    return {
+        "page_title": title,
+        "protection_event_count": protection_event_count,
+        "protection_days": round(protected_seconds / 86_400, 2),
+        "first_protection_at": first_protection_at,
+        "last_protection_at": last_protection_at,
+        "source": source,
+    }
+
+
+def xml_child_text(element: ET.Element, child_name: str) -> str:
+    for child in element:
+        if xml_local_name(child.tag) == child_name:
+            return child.text or ""
+    return ""
+
+
+def xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def parse_log_timestamp(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def max_restriction_expiry(left: str, right: str) -> str:
+    if right.lower() == "infinity" or left.lower() == "infinity":
+        return "infinity"
+    if not left:
+        return right
+    if not right:
+        return left
+    return max(left, right)
+
+
+def iter_mysql_insert_rows(path: Path, table_name: str) -> Iterable[list[str | None]]:
+    opener = gzip.open if path.suffix == ".gz" else open
+    prefix = f"INSERT INTO `{table_name}` VALUES "
+    with opener(path, "rt", encoding="utf-8", errors="replace", newline="") as file:
+        for line in file:
+            if not line.startswith(prefix):
+                continue
+            values = line[len(prefix):].strip()
+            if values.endswith(";"):
+                values = values[:-1]
+            for tuple_text in iter_mysql_value_tuples(values):
+                yield split_mysql_tuple(tuple_text)
+
+
+def iter_mysql_value_tuples(values: str) -> Iterable[str]:
+    in_quote = False
+    escape = False
+    depth = 0
+    start: int | None = None
+    for index, char in enumerate(values):
+        if in_quote:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == "'":
+                in_quote = False
+            continue
+        if char == "'":
+            in_quote = True
+        elif char == "(":
+            if depth == 0:
+                start = index + 1
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0 and start is not None:
+                yield values[start:index]
+                start = None
+
+
+def split_mysql_tuple(tuple_text: str) -> list[str | None]:
+    values: list[str | None] = []
+    buffer: list[str] = []
+    in_quote = False
+    escape = False
+    for char in tuple_text:
+        if in_quote:
+            if escape:
+                buffer.append(mysql_unescape_char(char))
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == "'":
+                in_quote = False
+            else:
+                buffer.append(char)
+            continue
+        if char == "'":
+            in_quote = True
+        elif char == ",":
+            values.append(mysql_field_value("".join(buffer)))
+            buffer = []
+        else:
+            buffer.append(char)
+    values.append(mysql_field_value("".join(buffer)))
+    return values
+
+
+def mysql_field_value(value: str) -> str | None:
+    value = value.strip()
+    if value.upper() == "NULL":
+        return None
+    return value
+
+
+def mysql_unescape_char(char: str) -> str:
+    return {
+        "0": "\0",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "b": "\b",
+        "Z": "\x1a",
+        "\\": "\\",
+        "'": "'",
+        '"': '"',
+    }.get(char, char)
+
+
 def local_history_dump_files(
     *,
     dump_dir: Path,
@@ -1331,6 +2145,42 @@ def main() -> None:
     rebuild_local_parser.add_argument("--start-partition")
     rebuild_local_parser.add_argument("--stop-partition")
     rebuild_local_parser.add_argument("--status-file", type=Path, default=Path("data/logs/method-rebuild-status.txt"))
+
+    admin_parser = subparsers.add_parser(
+        "import-admin-signals",
+        help="Import page-level governance/protection signals from local Wikimedia SQL dumps.",
+    )
+    admin_parser.add_argument("--snapshot", required=True, help="Regular dump snapshot, for example 20260501.")
+    admin_parser.add_argument("--wiki", default="enwiki")
+    admin_parser.add_argument("--dump-dir", type=Path, default=Path("data/admin-dumps"))
+    admin_parser.add_argument("--restrictions", type=Path)
+    admin_parser.add_argument("--download", action="store_true", default=True)
+    admin_parser.add_argument("--no-download", dest="download", action="store_false")
+
+    protection_parser = subparsers.add_parser(
+        "import-protection-log",
+        help="Import article protection durations from pages-logging XML dumps.",
+    )
+    protection_parser.add_argument("files", type=Path, nargs="*")
+    protection_parser.add_argument("--snapshot", required=True, help="Regular dump snapshot, for example 20260501.")
+    protection_parser.add_argument("--wiki", default="enwiki")
+    protection_parser.add_argument("--dump-dir", type=Path, default=Path("data/admin-dumps"))
+    protection_parser.add_argument("--download", action="store_true", default=False)
+    protection_parser.add_argument(
+        "--prefer-7z",
+        dest="prefer_7z",
+        action="store_true",
+        default=True,
+        help="When multiple compression formats are available, prefer the smallest (7z). Default on.",
+    )
+    protection_parser.add_argument(
+        "--no-7z",
+        dest="prefer_7z",
+        action="store_false",
+        help="Disable 7z preference and fall back to gz/bz2 ordering.",
+    )
+    protection_parser.add_argument("--source")
+    protection_parser.add_argument("--status-file", type=Path, default=Path("data/logs/protection-log-status.txt"))
 
     recompute_parser = subparsers.add_parser(
         "recompute",
@@ -1422,6 +2272,63 @@ def main() -> None:
             f"{datetime.now(timezone.utc).isoformat()} complete {len(files)}/{len(files)}\n",
             encoding="utf-8",
         )
+    elif args.command == "import-admin-signals":
+        restrictions_path = args.restrictions
+        if restrictions_path is None:
+            restrictions_path = args.dump_dir / f"{args.wiki}-{args.snapshot}-page_restrictions.sql.gz"
+        if args.download:
+            restrictions_path = download_current_sql_dump(
+                snapshot=args.snapshot,
+                wiki=args.wiki,
+                dump_name="page_restrictions",
+                output_dir=args.dump_dir,
+            )
+        count = import_page_restrictions_dump(
+            path=restrictions_path,
+            wiki=args.wiki,
+            source=f"{args.wiki}-{args.snapshot}-page_restrictions",
+        )
+        print(f"imported_page_admin_signals={count}")
+    elif args.command == "import-protection-log":
+        files = list(args.files)
+        if args.download:
+            # Match split pages-logging shards in any supported compression format
+            # (gz/bz2/7z). Avoid the unsplit logging.xml.gz so we do not double-ingest.
+            candidate_pattern = re.compile(
+                rf"^{re.escape(args.wiki)}-{re.escape(args.snapshot)}-pages-logging\d+\.xml"
+            )
+            all_filenames = list_current_dump_filenames(args.snapshot, args.wiki, candidate_pattern)
+            prefer = (".7z",) if args.prefer_7z else (".7z", ".bz2", ".gz")
+            filenames = pick_preferred_dump_format(
+                all_filenames,
+                base_pattern=re.compile(
+                    rf"^{re.escape(args.wiki)}-{re.escape(args.snapshot)}-pages-logging\d+\.xml$"
+                ),
+                prefer=prefer,
+            )
+            if not filenames:
+                raise SystemExit(
+                    f"No pages-logging shards found for snapshot={args.snapshot} wiki={args.wiki}."
+                )
+            files = [
+                download_current_dump_file(
+                    snapshot=args.snapshot,
+                    wiki=args.wiki,
+                    filename=filename,
+                    output_dir=args.dump_dir,
+                )
+                for filename in filenames
+            ]
+        if not files:
+            raise SystemExit("No pages-logging files provided or downloaded.")
+        count = import_protection_log_dumps(
+            paths=files,
+            wiki=args.wiki,
+            source=args.source or f"{args.wiki}-{args.snapshot}-pages-logging",
+            open_until=datetime.strptime(args.snapshot, "%Y%m%d").replace(tzinfo=timezone.utc),
+            status_file=args.status_file,
+        )
+        print(f"imported_page_admin_title_signals={count}")
     elif args.command == "recompute":
         periods = recompute_scoreboard_from_aggregates(
             period=args.period,

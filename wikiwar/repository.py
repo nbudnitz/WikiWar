@@ -16,6 +16,8 @@ from .schema import (
     historical_hourly_buckets,
     historical_page_aggregates,
     historical_processed_periods,
+    page_admin_signals,
+    page_admin_title_signals,
     loads,
     page_windows,
     raw_events,
@@ -317,6 +319,9 @@ def replace_historical_aggregates(session: Session, period: str, aggregates: lis
                 "talk_edit_count": aggregate.get("talk_edit_count", 0),
                 "talk_unique_editors": aggregate.get("talk_unique_editors", 0),
                 "talk_text_bytes": aggregate.get("talk_text_bytes", 0),
+                "talk_rfc_count": aggregate.get("talk_rfc_count", 0),
+                "talk_arbitration_count": aggregate.get("talk_arbitration_count", 0),
+                "talk_restriction_count": aggregate.get("talk_restriction_count", 0),
                 "first_timestamp": aggregate.get("first_timestamp"),
                 "last_timestamp": aggregate.get("last_timestamp"),
             }
@@ -338,6 +343,89 @@ def replace_historical_aggregates(session: Session, period: str, aggregates: lis
     if bucket_values:
         session.execute(insert(historical_hourly_buckets), bucket_values)
     session.commit()
+
+
+def replace_page_admin_signals(session: Session, wiki: str, signals: list[dict[str, Any]]) -> None:
+    imported_at = datetime.now(timezone.utc)
+    session.execute(delete(page_admin_signals).where(page_admin_signals.c.wiki == wiki))
+    values = []
+    for signal in signals:
+        values.append(
+            {
+                "wiki": wiki,
+                "page_id": int(signal["page_id"]),
+                "restriction_count": int(signal.get("restriction_count") or 0),
+                "restriction_types": str(signal.get("restriction_types") or ""),
+                "restriction_levels": str(signal.get("restriction_levels") or ""),
+                "has_extendedconfirmed": bool(signal.get("has_extendedconfirmed")),
+                "has_sysop": bool(signal.get("has_sysop")),
+                "has_cascade": bool(signal.get("has_cascade")),
+                "restriction_expiry": str(signal.get("restriction_expiry") or ""),
+                "protection_event_count": int(signal.get("protection_event_count") or 0),
+                "protection_days": float(signal.get("protection_days") or 0.0),
+                "source": str(signal.get("source") or ""),
+                "imported_at": imported_at,
+            }
+        )
+    if values:
+        session.execute(insert(page_admin_signals), values)
+    session.commit()
+
+
+def load_page_admin_signals(
+    session: Session,
+    keys: list[tuple[str, int]],
+) -> dict[tuple[str, int], dict[str, Any]]:
+    if not keys:
+        return {}
+    rows = session.execute(
+        select(page_admin_signals).where(
+            tuple_(page_admin_signals.c.wiki, page_admin_signals.c.page_id).in_(keys)
+        )
+    ).mappings()
+    return {
+        (str(row["wiki"]), int(row["page_id"])): dict(row)
+        for row in rows
+    }
+
+
+def replace_page_admin_title_signals(session: Session, wiki: str, signals: list[dict[str, Any]]) -> None:
+    imported_at = datetime.now(timezone.utc)
+    session.execute(delete(page_admin_title_signals).where(page_admin_title_signals.c.wiki == wiki))
+    values = []
+    for signal in signals:
+        values.append(
+            {
+                "wiki": wiki,
+                "page_title": str(signal["page_title"]),
+                "protection_event_count": int(signal.get("protection_event_count") or 0),
+                "protection_days": float(signal.get("protection_days") or 0.0),
+                "first_protection_at": signal.get("first_protection_at"),
+                "last_protection_at": signal.get("last_protection_at"),
+                "source": str(signal.get("source") or ""),
+                "imported_at": imported_at,
+            }
+        )
+    if values:
+        session.execute(insert(page_admin_title_signals), values)
+    session.commit()
+
+
+def load_page_admin_title_signals(
+    session: Session,
+    keys: list[tuple[str, str]],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    if not keys:
+        return {}
+    rows = session.execute(
+        select(page_admin_title_signals).where(
+            tuple_(page_admin_title_signals.c.wiki, page_admin_title_signals.c.page_title).in_(keys)
+        )
+    ).mappings()
+    return {
+        (str(row["wiki"]), str(row["page_title"])): dict(row)
+        for row in rows
+    }
 
 
 def mark_historical_period_processed(
@@ -452,6 +540,9 @@ def load_historical_year_aggregates(
     talk_edit_sum = func.sum(historical_page_aggregates.c.talk_edit_count).label("talk_edit_count")
     talk_unique_sum = func.sum(historical_page_aggregates.c.talk_unique_editors).label("talk_unique_editors")
     talk_text_max = func.max(historical_page_aggregates.c.talk_text_bytes).label("talk_text_bytes")
+    talk_rfc_sum = func.sum(historical_page_aggregates.c.talk_rfc_count).label("talk_rfc_count")
+    talk_arbitration_sum = func.sum(historical_page_aggregates.c.talk_arbitration_count).label("talk_arbitration_count")
+    talk_restriction_sum = func.sum(historical_page_aggregates.c.talk_restriction_count).label("talk_restriction_count")
     candidate_rows = session.execute(
         select(
             historical_page_aggregates.c.wiki,
@@ -466,6 +557,9 @@ def load_historical_year_aggregates(
             talk_edit_sum,
             talk_unique_sum,
             talk_text_max,
+            talk_rfc_sum,
+            talk_arbitration_sum,
+            talk_restriction_sum,
             func.min(historical_page_aggregates.c.first_timestamp).label("first_timestamp"),
             func.max(historical_page_aggregates.c.last_timestamp).label("last_timestamp"),
         )
@@ -536,9 +630,26 @@ def load_historical_year_page_stats(
     talk_edit_sum = func.sum(historical_page_aggregates.c.talk_edit_count).label("talk_edit_count")
     talk_unique_sum = func.sum(historical_page_aggregates.c.talk_unique_editors).label("talk_unique_editors")
     talk_text_max = func.max(historical_page_aggregates.c.talk_text_bytes).label("talk_text_bytes")
+    talk_rfc_sum = func.sum(historical_page_aggregates.c.talk_rfc_count).label("talk_rfc_count")
+    talk_arbitration_sum = func.sum(historical_page_aggregates.c.talk_arbitration_count).label("talk_arbitration_count")
+    talk_restriction_sum = func.sum(historical_page_aggregates.c.talk_restriction_count).label("talk_restriction_count")
     raw_revert_activity = raw_reverted_sum + raw_revert_sum
     if order == "most-discussed":
         ordering = (desc(talk_text_max), desc(talk_edit_sum), desc(raw_revert_activity), desc(edit_sum))
+    elif order == "governance":
+        governance_activity = (
+            talk_rfc_sum * 18
+            + talk_arbitration_sum * 24
+            + talk_restriction_sum * 20
+            + talk_edit_sum
+            + raw_revert_activity
+        )
+        ordering = (
+            desc(governance_activity),
+            desc(talk_text_max),
+            desc(raw_revert_activity),
+            desc(edit_sum),
+        )
     else:
         ordering = (desc(raw_revert_activity), desc(mutual_sum), desc(talk_edit_sum), desc(edit_sum))
 
@@ -557,6 +668,9 @@ def load_historical_year_page_stats(
             talk_edit_sum,
             talk_unique_sum,
             talk_text_max,
+            talk_rfc_sum,
+            talk_arbitration_sum,
+            talk_restriction_sum,
             func.min(historical_page_aggregates.c.first_timestamp).label("first_timestamp"),
             func.max(historical_page_aggregates.c.last_timestamp).label("last_timestamp"),
         )

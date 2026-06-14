@@ -110,7 +110,7 @@ def historical_snapshot_periods() -> dict[str, Any]:
 @app.get("/api/historical/scoreboard")
 def historical_snapshot_scoreboard(
     period: str | None = None,
-    method: str = Query(default="edit-war", pattern="^(edit-war|page-war|most-discussed)$"),
+    method: str = Query(default="edit-war", pattern="^(edit-war|page-war|most-discussed|governance)$"),
     limit: int = Query(default=50, ge=1, le=200),
 ) -> dict[str, Any]:
     candidate_limit = min(200, max(limit * 3, 30))
