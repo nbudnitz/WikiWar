@@ -166,6 +166,12 @@ h3 {
   border-bottom: 1px solid var(--line);
 }
 
+.scoreboard-controls {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
 select {
   height: 32px;
   border: 1px solid var(--line);
@@ -719,6 +725,12 @@ a:hover {
 
   .grid {
     grid-template-columns: 1fr;
+  }
+
+  .scoreboard-controls {
+    align-items: stretch;
+    flex-direction: column;
+    width: 100%;
   }
 
   .detail-panel {

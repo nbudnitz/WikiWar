@@ -44,6 +44,7 @@ document.getElementById("sortLive").addEventListener("change", (event) => {
 });
 
 document.getElementById("scoreboardPeriod").addEventListener("change", loadScoreboard);
+document.getElementById("scoreboardMethod").addEventListener("change", loadScoreboard);
 document.getElementById("scoreboardRows").addEventListener("click", (event) => {
   const toggle = event.target.closest(".related-segments-toggle");
   if (!toggle) return;
@@ -202,17 +203,19 @@ function renderEdits(edits) {
 async function loadScoreboard() {
   clearSwapAnimations();
   const value = document.getElementById("scoreboardPeriod").value;
+  const method = document.getElementById("scoreboardMethod").value;
   const isHistorical = value.startsWith("historical:");
   const selectedPeriod = isHistorical ? value.replace("historical:", "") : "";
   const rows = document.getElementById("scoreboardRows");
+  document.getElementById("scoreboardMethod").disabled = !isHistorical;
   rows.innerHTML = `<tr><td colspan="${scoreboardColumnCount(isHistorical)}">Loading scoreboard...</td></tr>`;
   const response = isHistorical
-    ? await fetch(`/api/historical/scoreboard?period=${encodeURIComponent(selectedPeriod)}&limit=20`)
+    ? await fetch(`/api/historical/scoreboard?period=${encodeURIComponent(selectedPeriod)}&method=${encodeURIComponent(method)}&limit=20`)
     : await fetch(`/api/scoreboard?hours=${value.replace("live:", "")}`);
   const payload = await response.json();
   document.getElementById("scoreboardTable").classList.toggle("is-historical", isHistorical);
   document.getElementById("scoreboardScoreHeader").textContent = "Score";
-  document.getElementById("scoreboardMetricA").textContent = isHistorical ? "Evidence" : "Reverts";
+  document.getElementById("scoreboardMetricA").textContent = isHistorical ? historicalMetricHeader(method) : "Reverts";
   document.getElementById("scoreboardMetricB").textContent = "Participants";
   document.getElementById("scoreboardMetricC").textContent = "Status";
   document.getElementById("scoreboardMetricB").hidden = isHistorical;
@@ -223,8 +226,8 @@ async function loadScoreboard() {
     return;
   }
   payload.rows.forEach((row) => {
-    const score = isHistorical ? (row.controversy_score ?? row.peak_score) : row.peak_score;
-    const metricA = isHistorical ? formatEvidence(row) : row.total_reverts;
+    const score = isHistorical ? historicalDisplayScore(row, method) : row.peak_score;
+    const metricA = isHistorical ? formatHistoricalMetric(row, method) : row.total_reverts;
     const tr = document.createElement("tr");
     tr.className = "scoreboard-row";
     tr.innerHTML = `
@@ -239,6 +242,17 @@ async function loadScoreboard() {
   });
 }
 
+function historicalDisplayScore(row, method) {
+  if (method === "edit-war") return row.controversy_score ?? row.candidate_score ?? row.peak_score;
+  return row.candidate_score ?? row.peak_score;
+}
+
+function historicalMetricHeader(method) {
+  if (method === "page-war") return "Signals";
+  if (method === "most-discussed") return "Talk";
+  return "Evidence";
+}
+
 function scoreboardPageCellHtml(row, isHistorical, score) {
   return `
     <td class="scoreboard-page-cell" title="${escapeHtml(row.page_title)}">
@@ -249,6 +263,24 @@ function scoreboardPageCellHtml(row, isHistorical, score) {
 }
 
 function scoreboardRankingMetricsHtml(row, score) {
+  if (row.ranking_method === "page-war") {
+    return `
+      <div class="scoreboard-rank-metrics" aria-label="Historical ranking evidence">
+        ${rankingMetricHtml("Score", score)}
+        ${rankingMetricHtml("Raw", Number(row.raw_reverted_count || 0) + Number(row.raw_revert_count || 0))}
+        ${rankingMetricHtml("Talk", row.talk_text_bytes)}
+      </div>
+    `;
+  }
+  if (row.ranking_method === "most-discussed") {
+    return `
+      <div class="scoreboard-rank-metrics" aria-label="Historical ranking evidence">
+        ${rankingMetricHtml("Score", score)}
+        ${rankingMetricHtml("Talk bytes", row.talk_text_bytes)}
+        ${rankingMetricHtml("Talk edits", row.talk_edit_count)}
+      </div>
+    `;
+  }
   return `
     <div class="scoreboard-rank-metrics" aria-label="Historical ranking evidence">
       ${rankingMetricHtml("Score", score)}
@@ -275,6 +307,18 @@ function formatLength(minutes) {
   return `${fmt.format(Number(minutes || 0))} min`;
 }
 
+function formatHistoricalMetric(row, method) {
+  if (method === "page-war") {
+    const raw = Number(row.raw_reverted_count || 0) + Number(row.raw_revert_count || 0);
+    const talk = Number(row.talk_edit_count || 0);
+    return `${fmt.format(raw)} raw, ${fmt.format(talk)} talk`;
+  }
+  if (method === "most-discussed") {
+    return `${formatBytes(row.talk_text_bytes)} talk`;
+  }
+  return formatEvidence(row);
+}
+
 function formatEvidence(row) {
   if (row.battle_count == null && row.talk_evidence_count == null) {
     const pairs = Number(row.mutual_revert_pairs || 0);
@@ -284,6 +328,13 @@ function formatEvidence(row) {
   const battles = Number(row.battle_count || 0);
   const talk = Number(row.talk_evidence_count || 0);
   return `${fmt.format(battles)} battle${battles === 1 ? "" : "s"}, ${fmt.format(talk)} talk`;
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (bytes >= 1_000_000) return `${fmt.format(bytes / 1_000_000)} MB`;
+  if (bytes >= 1_000) return `${fmt.format(bytes / 1_000)} KB`;
+  return `${fmt.format(bytes)} B`;
 }
 
 async function toggleScoreboardSegments(rowElement, row, isHistorical, selectedPeriod) {

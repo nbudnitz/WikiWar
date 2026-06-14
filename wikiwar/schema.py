@@ -17,6 +17,8 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    inspect,
+    text,
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
@@ -153,6 +155,12 @@ historical_page_aggregates = Table(
     Column("unique_editors", Integer, nullable=False),
     Column("revert_count", Integer, nullable=False),
     Column("mutual_revert_pairs", Integer, nullable=False),
+    Column("raw_reverted_count", Integer, nullable=False, default=0),
+    Column("raw_revert_count", Integer, nullable=False, default=0),
+    Column("talk_page_id", Integer, nullable=True),
+    Column("talk_edit_count", Integer, nullable=False, default=0),
+    Column("talk_unique_editors", Integer, nullable=False, default=0),
+    Column("talk_text_bytes", Integer, nullable=False, default=0),
     Column("first_timestamp", DateTime(timezone=True), nullable=True),
     Column("last_timestamp", DateTime(timezone=True), nullable=True),
     UniqueConstraint("period", "wiki", "page_id", name="uq_hist_page_aggregate_period_page"),
@@ -242,4 +250,27 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False
 
 
 def init_db(bind: Engine | None = None) -> None:
-    metadata.create_all(bind or engine)
+    target = bind or engine
+    metadata.create_all(target)
+    migrate_sqlite_schema(target)
+
+
+def migrate_sqlite_schema(bind: Engine) -> None:
+    if bind.dialect.name != "sqlite":
+        return
+    inspector = inspect(bind)
+    if "historical_page_aggregates" not in inspector.get_table_names():
+        return
+    existing = {column["name"] for column in inspector.get_columns("historical_page_aggregates")}
+    migrations = {
+        "raw_reverted_count": "ALTER TABLE historical_page_aggregates ADD COLUMN raw_reverted_count INTEGER NOT NULL DEFAULT 0",
+        "raw_revert_count": "ALTER TABLE historical_page_aggregates ADD COLUMN raw_revert_count INTEGER NOT NULL DEFAULT 0",
+        "talk_page_id": "ALTER TABLE historical_page_aggregates ADD COLUMN talk_page_id INTEGER",
+        "talk_edit_count": "ALTER TABLE historical_page_aggregates ADD COLUMN talk_edit_count INTEGER NOT NULL DEFAULT 0",
+        "talk_unique_editors": "ALTER TABLE historical_page_aggregates ADD COLUMN talk_unique_editors INTEGER NOT NULL DEFAULT 0",
+        "talk_text_bytes": "ALTER TABLE historical_page_aggregates ADD COLUMN talk_text_bytes INTEGER NOT NULL DEFAULT 0",
+    }
+    with bind.begin() as connection:
+        for column, statement in migrations.items():
+            if column not in existing:
+                connection.execute(text(statement))

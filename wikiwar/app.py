@@ -110,6 +110,7 @@ def historical_snapshot_periods() -> dict[str, Any]:
 @app.get("/api/historical/scoreboard")
 def historical_snapshot_scoreboard(
     period: str | None = None,
+    method: str = Query(default="edit-war", pattern="^(edit-war|page-war|most-discussed)$"),
     limit: int = Query(default=50, ge=1, le=200),
 ) -> dict[str, Any]:
     candidate_limit = min(200, max(limit * 3, 30))
@@ -120,13 +121,19 @@ def historical_snapshot_scoreboard(
             selected_period = available_periods[0] if available_periods else None
         selected_period_is_year = is_historical_year_period(selected_period)
         if selected_period_is_year:
-            rows = historical_year_scoreboard(session, period=selected_period or "", limit=candidate_limit)
+            rows = historical_year_scoreboard(
+                session,
+                period=selected_period or "",
+                limit=candidate_limit,
+                method=method,
+            )
         else:
             rows = historical_scoreboard(session, selected_period, candidate_limit)
-        rows = apply_cached_historical_evidence(session, rows)
+        if method == "edit-war":
+            rows = apply_cached_historical_evidence(session, rows)
     selected_period = rows[0]["period"] if rows else selected_period
     rows = rows[:limit]
-    return {"period": selected_period, "rows": serialize(rows)}
+    return {"period": selected_period, "method": method, "rows": serialize(rows)}
 
 
 @app.get("/api/historical/evidence/status")

@@ -311,6 +311,12 @@ def replace_historical_aggregates(session: Session, period: str, aggregates: lis
                 "unique_editors": aggregate["unique_editors"],
                 "revert_count": aggregate["revert_count"],
                 "mutual_revert_pairs": aggregate["mutual_revert_pairs"],
+                "raw_reverted_count": aggregate.get("raw_reverted_count", 0),
+                "raw_revert_count": aggregate.get("raw_revert_count", 0),
+                "talk_page_id": aggregate.get("talk_page_id"),
+                "talk_edit_count": aggregate.get("talk_edit_count", 0),
+                "talk_unique_editors": aggregate.get("talk_unique_editors", 0),
+                "talk_text_bytes": aggregate.get("talk_text_bytes", 0),
                 "first_timestamp": aggregate.get("first_timestamp"),
                 "last_timestamp": aggregate.get("last_timestamp"),
             }
@@ -441,6 +447,11 @@ def load_historical_year_aggregates(
     edit_sum = func.sum(historical_page_aggregates.c.edit_count).label("edit_count")
     revert_sum = func.sum(historical_page_aggregates.c.revert_count).label("revert_count")
     mutual_sum = func.sum(historical_page_aggregates.c.mutual_revert_pairs).label("mutual_revert_pairs")
+    raw_reverted_sum = func.sum(historical_page_aggregates.c.raw_reverted_count).label("raw_reverted_count")
+    raw_revert_sum = func.sum(historical_page_aggregates.c.raw_revert_count).label("raw_revert_count")
+    talk_edit_sum = func.sum(historical_page_aggregates.c.talk_edit_count).label("talk_edit_count")
+    talk_unique_sum = func.sum(historical_page_aggregates.c.talk_unique_editors).label("talk_unique_editors")
+    talk_text_max = func.max(historical_page_aggregates.c.talk_text_bytes).label("talk_text_bytes")
     candidate_rows = session.execute(
         select(
             historical_page_aggregates.c.wiki,
@@ -449,6 +460,12 @@ def load_historical_year_aggregates(
             edit_sum,
             revert_sum,
             mutual_sum,
+            raw_reverted_sum,
+            raw_revert_sum,
+            func.max(historical_page_aggregates.c.talk_page_id).label("talk_page_id"),
+            talk_edit_sum,
+            talk_unique_sum,
+            talk_text_max,
             func.min(historical_page_aggregates.c.first_timestamp).label("first_timestamp"),
             func.max(historical_page_aggregates.c.last_timestamp).label("last_timestamp"),
         )
@@ -497,6 +514,58 @@ def load_historical_year_aggregates(
         candidate["buckets"] = buckets_by_page.get(key, [])
         result.append(candidate)
     return result
+
+
+def load_historical_year_page_stats(
+    session: Session,
+    year_period: str,
+    candidate_limit: int = 500,
+    *,
+    order: str = "page-war",
+) -> list[dict[str, Any]]:
+    month_periods = historical_month_periods_for_year(historical_month_periods(session), year_period)
+    if not month_periods:
+        return []
+
+    edit_sum = func.sum(historical_page_aggregates.c.edit_count).label("edit_count")
+    unique_sum = func.sum(historical_page_aggregates.c.unique_editors).label("unique_editors")
+    revert_sum = func.sum(historical_page_aggregates.c.revert_count).label("revert_count")
+    mutual_sum = func.sum(historical_page_aggregates.c.mutual_revert_pairs).label("mutual_revert_pairs")
+    raw_reverted_sum = func.sum(historical_page_aggregates.c.raw_reverted_count).label("raw_reverted_count")
+    raw_revert_sum = func.sum(historical_page_aggregates.c.raw_revert_count).label("raw_revert_count")
+    talk_edit_sum = func.sum(historical_page_aggregates.c.talk_edit_count).label("talk_edit_count")
+    talk_unique_sum = func.sum(historical_page_aggregates.c.talk_unique_editors).label("talk_unique_editors")
+    talk_text_max = func.max(historical_page_aggregates.c.talk_text_bytes).label("talk_text_bytes")
+    raw_revert_activity = raw_reverted_sum + raw_revert_sum
+    if order == "most-discussed":
+        ordering = (desc(talk_text_max), desc(talk_edit_sum), desc(raw_revert_activity), desc(edit_sum))
+    else:
+        ordering = (desc(raw_revert_activity), desc(mutual_sum), desc(talk_edit_sum), desc(edit_sum))
+
+    rows = session.execute(
+        select(
+            historical_page_aggregates.c.wiki,
+            historical_page_aggregates.c.page_id,
+            func.max(historical_page_aggregates.c.page_title).label("page_title"),
+            edit_sum,
+            unique_sum,
+            revert_sum,
+            mutual_sum,
+            raw_reverted_sum,
+            raw_revert_sum,
+            func.max(historical_page_aggregates.c.talk_page_id).label("talk_page_id"),
+            talk_edit_sum,
+            talk_unique_sum,
+            talk_text_max,
+            func.min(historical_page_aggregates.c.first_timestamp).label("first_timestamp"),
+            func.max(historical_page_aggregates.c.last_timestamp).label("last_timestamp"),
+        )
+        .where(historical_page_aggregates.c.period.in_(month_periods))
+        .group_by(historical_page_aggregates.c.wiki, historical_page_aggregates.c.page_id)
+        .order_by(*ordering)
+        .limit(candidate_limit)
+    ).mappings()
+    return [dict(row) for row in rows]
 
 
 def load_historical_aggregates(session: Session, period: str) -> list[dict[str, Any]]:

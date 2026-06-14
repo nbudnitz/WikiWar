@@ -87,14 +87,21 @@
             <h2>
               Scoreboard
             </h2>
-            <select id="scoreboardPeriod" aria-label="Scoreboard period">
-              <optgroup label="Live windows">
-                <option value="live:1">Last hour</option>
-                <option value="live:24" selected>Last 24 hours</option>
-                <option value="live:168">Last 7 days</option>
-              </optgroup>
-              <optgroup id="historicalPeriods" label="Historical years"></optgroup>
-            </select>
+            <div class="scoreboard-controls">
+              <select id="scoreboardMethod" aria-label="Historical ranking method">
+                <option value="edit-war">Method 1: Edit War Priority</option>
+                <option value="page-war">Method 2: Page War Priority</option>
+                <option value="most-discussed">Method 3: Most Discussed</option>
+              </select>
+              <select id="scoreboardPeriod" aria-label="Scoreboard period">
+                <optgroup label="Live windows">
+                  <option value="live:1">Last hour</option>
+                  <option value="live:24" selected>Last 24 hours</option>
+                  <option value="live:168">Last 7 days</option>
+                </optgroup>
+                <optgroup id="historicalPeriods" label="Historical years"></optgroup>
+              </select>
+            </div>
           </div>
           <table id="scoreboardTable" class="scoreboard-table">
             <thead>
@@ -128,6 +135,12 @@
             Historical scoreboards are grouped by year. Monthly dump partitions remain the durable
             backfill unit, and each completed month is folded into its year from local aggregate
             tables when the scoreboard is queried.
+          </p>
+          <p>
+            Historical rankings can be switched between Method 1: Edit War Priority, which preserves
+            the strict mutual-revert scoreboard; Method 2: Page War Priority, which also admits pages
+            with heavy raw revert activity, broad multi-editor churn, and talk-page activity; and
+            Method 3: Most Discussed, which ranks by observed talk-page byte length in the selected year.
           </p>
           <p>
             Battle drill-downs use targeted MediaWiki revision-content diffs. For large historical

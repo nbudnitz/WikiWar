@@ -24,6 +24,7 @@ from .repository import (
     historical_aggregate_period_exists,
     historical_aggregate_periods,
     historical_processed_period_exists,
+    load_historical_year_page_stats,
     load_historical_year_aggregates,
     load_historical_aggregates,
     mark_historical_period_processed,
@@ -51,6 +52,8 @@ PAGE_TITLE_HISTORICAL = 29
 PAGE_TITLE = 30
 PAGE_NAMESPACE_HISTORICAL = 31
 REVISION_ID = 60
+REVISION_TEXT_BYTES = 65
+REVISION_TEXT_BYTES_DIFF = 66
 REVISION_IS_IDENTITY_REVERTED = 72
 REVISION_FIRST_IDENTITY_REVERTING_REVISION_ID = 73
 REVISION_IS_IDENTITY_REVERT = 75
@@ -58,6 +61,27 @@ HISTORICAL_BUCKET_MINUTES = 60
 HISTORICAL_WINDOW_HOURS = 24
 HISTORICAL_REVERT_EDGE_THRESHOLD = 4
 HISTORICAL_ADDITIONAL_PAIR_WEIGHT = 0.25
+ROUTINE_UPDATE_TITLE_RE = re.compile(
+    r"\b("
+    r"list of|season|championship|championships|tournament|cup|league|roster|squad|"
+    r"standings|results|statistics|records|record|draft|episode|episodes|discography|"
+    r"filmography|awards?|medal table|schedule|rankings?|transfers"
+    r")\b",
+    re.IGNORECASE,
+)
+STRONG_ROUTINE_UPDATE_TITLE_RE = re.compile(
+    r"\b("
+    r"list of (?:programs|episodes|missions|champions|winners|awards|records|songs|singles|"
+    r"albums|characters|players|squads|rosters|results|standings|rankings)|"
+    r"episodes?|discography|filmography|roster|squad|standings|results|schedule|"
+    r"statistics|rankings?|transfers"
+    r")\b",
+    re.IGNORECASE,
+)
+SEASON_TITLE_RE = re.compile(
+    r"\b(?:18|19|20)\d{2}(?:[-\u2013]\d{2})?\b.*\b(season|championship|tournament|cup|league|draft|election results)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -68,6 +92,8 @@ class HistoricalRevision:
     timestamp: datetime
     user_text: str
     rev_id: int
+    text_bytes: int
+    text_bytes_diff: int
     is_identity_reverted: bool
     first_identity_reverting_revision_id: int | None
     is_identity_revert: bool
@@ -98,6 +124,14 @@ class PageHistoricalAggregate:
     unique_editor_count: int | None = None
     first_timestamp: datetime | None = None
     last_timestamp: datetime | None = None
+    raw_reverted_count: int = 0
+    raw_revert_count: int = 0
+    text_bytes: int = 0
+    talk_page_id: int | None = None
+    talk_edit_count: int = 0
+    talk_editors: set[str] = field(default_factory=set)
+    talk_unique_editor_count: int | None = None
+    talk_text_bytes: int = 0
     revert_edges: Counter[tuple[str, str]] = field(default_factory=Counter)
     buckets: dict[datetime, HistoricalBucket] = field(default_factory=dict)
 
@@ -109,6 +143,9 @@ class PageHistoricalAggregate:
             self.first_timestamp = revision.timestamp
         if self.last_timestamp is None or revision.timestamp > self.last_timestamp:
             self.last_timestamp = revision.timestamp
+            self.text_bytes = max(0, revision.text_bytes)
+        self.raw_reverted_count += int(revision.is_identity_reverted)
+        self.raw_revert_count += int(revision.is_identity_revert)
         self._bucket(revision.timestamp).add_revision(revision)
 
     def add_revert(self, reverter: str, reverted: str, timestamp: datetime | None = None) -> None:
@@ -120,6 +157,13 @@ class PageHistoricalAggregate:
     def _bucket(self, timestamp: datetime) -> HistoricalBucket:
         bucket_start = _bucket_start(timestamp)
         return self.buckets.setdefault(bucket_start, HistoricalBucket())
+
+    def add_talk_revision(self, revision: HistoricalRevision) -> None:
+        self.talk_page_id = revision.page_id
+        self.talk_edit_count += 1
+        self.talk_editors.add(revision.user_text)
+        self.talk_unique_editor_count = None
+        self.talk_text_bytes = max(self.talk_text_bytes, max(0, revision.text_bytes))
 
 
 @dataclass(frozen=True)
@@ -431,6 +475,8 @@ def parse_history_row(columns: list[str], namespace: int = 0) -> HistoricalRevis
         timestamp=timestamp,
         user_text=user_text,
         rev_id=rev_id,
+        text_bytes=_int(columns[REVISION_TEXT_BYTES]) or 0,
+        text_bytes_diff=_int(columns[REVISION_TEXT_BYTES_DIFF]) or 0,
         is_identity_reverted=_bool(columns[REVISION_IS_IDENTITY_REVERTED]),
         first_identity_reverting_revision_id=_int(
             columns[REVISION_FIRST_IDENTITY_REVERTING_REVISION_ID]
@@ -449,6 +495,8 @@ def process_history_files(
     write: bool = True,
 ) -> HistoricalJobResult:
     aggregates: dict[tuple[str, int], PageHistoricalAggregate] = {}
+    aggregates_by_title: dict[tuple[str, str], PageHistoricalAggregate] = {}
+    pending_talk_revisions: dict[tuple[str, str], list[HistoricalRevision]] = defaultdict(list)
     pending_reverts: dict[int, list[HistoricalRevision]] = defaultdict(list)
     rows_seen = 0
     revisions_seen = 0
@@ -457,10 +505,25 @@ def process_history_files(
         with bz2.open(path, "rt", encoding="utf-8", newline="") as file:
             for line in file:
                 rows_seen += 1
-                revision = parse_history_row(line.rstrip("\n").split("\t"), namespace)
+                columns = line.rstrip("\n").split("\t")
+                row_namespace = _int(columns[PAGE_NAMESPACE_HISTORICAL]) if len(columns) > PAGE_NAMESPACE_HISTORICAL else -1
+                if namespace == 0 and row_namespace not in {0, 1}:
+                    continue
+                if namespace != 0 and row_namespace != namespace:
+                    continue
+                revision = parse_history_row(columns, row_namespace)
                 if revision is None:
                     continue
                 revisions_seen += 1
+                if row_namespace == 1:
+                    title_key = (revision.wiki, normalize_history_title(revision.page_title))
+                    article = aggregates_by_title.get(title_key)
+                    if article:
+                        article.add_talk_revision(revision)
+                    else:
+                        pending_talk_revisions[title_key].append(revision)
+                    continue
+
                 key = (revision.wiki, revision.page_id)
                 aggregate = aggregates.setdefault(
                     key,
@@ -470,7 +533,11 @@ def process_history_files(
                         page_title=revision.page_title,
                     ),
                 )
+                aggregates_by_title[(revision.wiki, normalize_history_title(revision.page_title))] = aggregate
                 aggregate.add_revision(revision)
+                title_key = (revision.wiki, normalize_history_title(revision.page_title))
+                for talk_revision in pending_talk_revisions.pop(title_key, []):
+                    aggregate.add_talk_revision(talk_revision)
 
                 reverted_user = dominant_reverted_user(
                     pending_reverts.pop(revision.rev_id, []),
@@ -485,7 +552,7 @@ def process_history_files(
     scored_rows = [
         row
         for row in (score_historical_page(aggregate) for aggregate in aggregates.values())
-        if row["peak_score"] >= min_score
+        if candidate_row_passes_min_score(row, min_score)
     ]
     selected = rank_historical_rows(scored_rows, limit)
 
@@ -536,7 +603,7 @@ def recompute_scoreboard_from_aggregates(
             scored_rows = [
                 row
                 for row in (score_historical_page(aggregate) for aggregate in aggregates)
-                if row["peak_score"] >= min_score
+                if candidate_row_passes_min_score(row, min_score)
             ]
             selected = rank_historical_rows(scored_rows, limit)
             replace_scoreboard_snapshot(session, selected_period, selected)
@@ -550,8 +617,14 @@ def historical_year_scoreboard(
     period: str,
     limit: int = 100,
     min_score: float = 40.0,
+    method: str = "edit-war",
 ) -> list[dict[str, object]]:
-    candidate_limit = max(limit * 4, 100)
+    if method == "page-war":
+        return historical_year_page_war_scoreboard(session, period=period, limit=limit, min_score=min_score)
+    if method == "most-discussed":
+        return historical_year_most_discussed_scoreboard(session, period=period, limit=limit)
+
+    candidate_limit = max(limit * 10, 1000)
     aggregates = [
         record_to_aggregate(record)
         for record in load_historical_year_aggregates(session, period, candidate_limit)
@@ -559,7 +632,7 @@ def historical_year_scoreboard(
     scored_rows = [
         row
         for row in (score_historical_page(aggregate) for aggregate in aggregates)
-        if row["peak_score"] >= min_score
+        if candidate_row_passes_min_score(row, min_score)
         and not probable_revert_only_cleanup_row(row)
     ]
     selected = rank_historical_rows(scored_rows, limit)
@@ -567,7 +640,146 @@ def historical_year_scoreboard(
         row["id"] = None
         row["period"] = period
         row["rank"] = rank
+        row["ranking_method"] = "edit-war"
     return selected
+
+
+def historical_year_page_war_scoreboard(
+    session,
+    *,
+    period: str,
+    limit: int = 100,
+    min_score: float = 40.0,
+) -> list[dict[str, object]]:
+    candidate_limit = max(limit * 20, 1000)
+    rows = [
+        page_war_score_row(record)
+        for record in load_historical_year_page_stats(session, period, candidate_limit, order="page-war")
+    ]
+    rows = [
+        row
+        for row in rows
+        if float(row["candidate_score"]) >= min_score
+        and not probable_routine_page_war_row(row)
+    ]
+    rows.sort(
+        key=lambda row: (
+            row["candidate_score"],
+            row["raw_reverted_count"] + row["raw_revert_count"],
+            row["talk_text_bytes"],
+            row["edit_count"],
+        ),
+        reverse=True,
+    )
+    selected = rows[:limit]
+    for rank, row in enumerate(selected, start=1):
+        row["id"] = None
+        row["period"] = period
+        row["rank"] = rank
+        row["ranking_method"] = "page-war"
+    return selected
+
+
+def historical_year_most_discussed_scoreboard(
+    session,
+    *,
+    period: str,
+    limit: int = 100,
+) -> list[dict[str, object]]:
+    candidate_limit = max(limit * 20, 1000)
+    rows = [
+        most_discussed_score_row(record)
+        for record in load_historical_year_page_stats(session, period, candidate_limit, order="most-discussed")
+    ]
+    rows = [row for row in rows if int(row["talk_text_bytes"]) > 0 or int(row["talk_edit_count"]) > 0]
+    rows.sort(
+        key=lambda row: (
+            row["candidate_score"],
+            row["talk_edit_count"],
+            row["raw_reverted_count"] + row["raw_revert_count"],
+        ),
+        reverse=True,
+    )
+    selected = rows[:limit]
+    for rank, row in enumerate(selected, start=1):
+        row["id"] = None
+        row["period"] = period
+        row["rank"] = rank
+        row["ranking_method"] = "most-discussed"
+    return selected
+
+
+def page_war_score_row(record: dict[str, object]) -> dict[str, object]:
+    edit_count = int(record.get("edit_count") or 0)
+    unique_editors = int(record.get("unique_editors") or 0)
+    raw_reverted_count = int(record.get("raw_reverted_count") or 0)
+    raw_revert_count = int(record.get("raw_revert_count") or 0)
+    mutual_pairs = int(record.get("mutual_revert_pairs") or 0)
+    mutual_reverts = int(record.get("revert_count") or 0)
+    talk_edit_count = int(record.get("talk_edit_count") or 0)
+    talk_text_bytes = int(record.get("talk_text_bytes") or 0)
+    raw_revert_activity = raw_reverted_count + raw_revert_count
+    score = (
+        math.sqrt(raw_reverted_count) * 24.0
+        + math.sqrt(raw_revert_count) * 18.0
+        + math.sqrt(max(0, mutual_reverts)) * 16.0
+        + min(42.0, mutual_pairs * 8.0)
+        + min(50.0, math.log1p(max(0, edit_count)) * 6.0)
+        + min(35.0, math.sqrt(max(0, unique_editors)) * 4.2)
+        + min(45.0, math.log1p(max(0, talk_text_bytes)) * 3.2)
+        + min(25.0, math.sqrt(max(0, talk_edit_count)) * 4.0)
+    )
+    row = {
+        **record,
+        "peak_score": round(score, 2),
+        "candidate_score": round(score * (1.0 - routine_update_penalty({**record, "peak_score": score})), 2),
+        "score_area": 0.0,
+        "war_minutes": 0,
+        "episode_count": 0,
+        "raw_reverted_count": raw_reverted_count,
+        "raw_revert_count": raw_revert_count,
+        "revert_count": mutual_reverts,
+        "mutual_revert_pairs": mutual_pairs,
+        "raw_revert_activity": raw_revert_activity,
+        "talk_edit_count": talk_edit_count,
+        "talk_text_bytes": talk_text_bytes,
+        "battle_count": None,
+        "talk_evidence_count": talk_edit_count,
+    }
+    row["routine_penalty"] = round(routine_update_penalty(row), 4)
+    row["candidate_score"] = round(score * (1.0 - float(row["routine_penalty"])), 2)
+    return row
+
+
+def most_discussed_score_row(record: dict[str, object]) -> dict[str, object]:
+    talk_text_bytes = int(record.get("talk_text_bytes") or 0)
+    talk_edit_count = int(record.get("talk_edit_count") or 0)
+    score = float(talk_text_bytes)
+    return {
+        **record,
+        "peak_score": score,
+        "candidate_score": score,
+        "score_area": 0.0,
+        "war_minutes": 0,
+        "episode_count": 0,
+        "raw_reverted_count": int(record.get("raw_reverted_count") or 0),
+        "raw_revert_count": int(record.get("raw_revert_count") or 0),
+        "revert_count": int(record.get("revert_count") or 0),
+        "mutual_revert_pairs": int(record.get("mutual_revert_pairs") or 0),
+        "talk_edit_count": talk_edit_count,
+        "talk_text_bytes": talk_text_bytes,
+        "battle_count": None,
+        "talk_evidence_count": talk_edit_count,
+    }
+
+
+def probable_routine_page_war_row(row: dict[str, object]) -> bool:
+    title = str(row.get("page_title") or "")
+    raw_revert_activity = int(row.get("raw_reverted_count") or 0) + int(row.get("raw_revert_count") or 0)
+    talk_text_bytes = int(row.get("talk_text_bytes") or 0)
+    if STRONG_ROUTINE_UPDATE_TITLE_RE.search(title.replace("_", " ")) and talk_text_bytes < 10_000:
+        return raw_revert_activity < 45
+    return False
 
 
 def probable_revert_only_cleanup_row(row: dict[str, object]) -> bool:
@@ -590,28 +802,53 @@ def probable_revert_only_cleanup_row(row: dict[str, object]) -> bool:
 def rank_historical_rows(rows: list[dict[str, object]], limit: int) -> list[dict[str, object]]:
     rows.sort(
         key=lambda row: (
-            row["peak_score"],
+            row.get("candidate_score", row["peak_score"]),
             row["mutual_revert_pairs"],
             row["revert_count"],
+            row["peak_score"],
         ),
         reverse=True,
     )
     return rows[:limit]
 
 
+def candidate_row_passes_min_score(row: dict[str, object], min_score: float) -> bool:
+    return float(row.get("candidate_score", row.get("peak_score", 0.0)) or 0.0) >= min_score
+
+
+def normalize_history_title(title: str) -> str:
+    return title.replace(" ", "_").removeprefix("Talk:")
+
+
 def aggregate_to_record(aggregate: PageHistoricalAggregate) -> dict[str, object] | None:
     revert_count = sum(mutual_revert_edges(effective_revert_edges(aggregate.revert_edges)).values())
-    if revert_count == 0:
-        return None
     mutual_pairs, _ = mutual_revert_metrics_from_edges(effective_revert_edges(aggregate.revert_edges))
+    unique_editors = aggregate.unique_editor_count if aggregate.unique_editor_count is not None else len(aggregate.editors)
+    if not should_store_historical_aggregate(
+        edit_count=aggregate.edit_count,
+        unique_editors=unique_editors,
+        raw_reverted_count=aggregate.raw_reverted_count,
+        raw_revert_count=aggregate.raw_revert_count,
+        mutual_revert_count=revert_count,
+        mutual_revert_pairs=mutual_pairs,
+        talk_edit_count=aggregate.talk_edit_count,
+        talk_text_bytes=aggregate.talk_text_bytes,
+    ):
+        return None
     return {
         "wiki": aggregate.wiki,
         "page_id": aggregate.page_id,
         "page_title": aggregate.page_title,
         "edit_count": aggregate.edit_count,
-        "unique_editors": aggregate.unique_editor_count if aggregate.unique_editor_count is not None else len(aggregate.editors),
+        "unique_editors": unique_editors,
         "revert_count": revert_count,
         "mutual_revert_pairs": mutual_pairs,
+        "raw_reverted_count": aggregate.raw_reverted_count,
+        "raw_revert_count": aggregate.raw_revert_count,
+        "talk_page_id": aggregate.talk_page_id,
+        "talk_edit_count": aggregate.talk_edit_count,
+        "talk_unique_editors": len(aggregate.talk_editors),
+        "talk_text_bytes": aggregate.talk_text_bytes,
         "first_timestamp": aggregate.first_timestamp,
         "last_timestamp": aggregate.last_timestamp,
         "buckets": [
@@ -629,6 +866,29 @@ def aggregate_to_record(aggregate: PageHistoricalAggregate) -> dict[str, object]
     }
 
 
+def should_store_historical_aggregate(
+    *,
+    edit_count: int,
+    unique_editors: int,
+    raw_reverted_count: int,
+    raw_revert_count: int,
+    mutual_revert_count: int,
+    mutual_revert_pairs: int,
+    talk_edit_count: int,
+    talk_text_bytes: int,
+) -> bool:
+    raw_revert_activity = raw_reverted_count + raw_revert_count
+    if mutual_revert_count > 0 or mutual_revert_pairs > 0:
+        return True
+    if raw_reverted_count >= 3 or raw_revert_count >= 3:
+        return True
+    if edit_count >= 40 and unique_editors >= 8 and raw_revert_activity >= 2:
+        return True
+    if talk_edit_count >= 3 or talk_text_bytes >= 12_000:
+        return True
+    return False
+
+
 def record_to_aggregate(record: dict[str, object]) -> PageHistoricalAggregate:
     aggregate = PageHistoricalAggregate(
         wiki=str(record["wiki"]),
@@ -638,6 +898,12 @@ def record_to_aggregate(record: dict[str, object]) -> PageHistoricalAggregate:
         unique_editor_count=int(record["unique_editors"]),
         first_timestamp=record.get("first_timestamp"),  # type: ignore[arg-type]
         last_timestamp=record.get("last_timestamp"),  # type: ignore[arg-type]
+        raw_reverted_count=int(record.get("raw_reverted_count") or 0),
+        raw_revert_count=int(record.get("raw_revert_count") or 0),
+        talk_page_id=int(record["talk_page_id"]) if record.get("talk_page_id") else None,
+        talk_edit_count=int(record.get("talk_edit_count") or 0),
+        talk_unique_editor_count=int(record.get("talk_unique_editors") or 0),
+        talk_text_bytes=int(record.get("talk_text_bytes") or 0),
     )
     for bucket_record in record.get("buckets", []):  # type: ignore[union-attr]
         bucket = HistoricalBucket(
@@ -704,8 +970,10 @@ def score_historical_page(aggregate: PageHistoricalAggregate) -> dict[str, objec
     revert_count = sum(contested_edges.values())
     unique_editors = aggregate.unique_editor_count if aggregate.unique_editor_count is not None else len(aggregate.editors)
     revert_density = revert_count / aggregate.edit_count if aggregate.edit_count else 0.0
-    mutual_pairs, _ = mutual_revert_metrics_from_edges(effective_edges)
-    return {
+    mutual_pairs, mutual_count = mutual_revert_metrics_from_edges(effective_edges)
+    top_reverter_share = top_reverter_share_from_edges(contested_edges)
+    strongest_pair_share = strongest_bidirectional_pair_share(contested_edges)
+    row: dict[str, object] = {
         "wiki": aggregate.wiki,
         "page_id": aggregate.page_id,
         "page_title": aggregate.page_title,
@@ -717,8 +985,25 @@ def score_historical_page(aggregate: PageHistoricalAggregate) -> dict[str, objec
         "unique_editors": unique_editors,
         "revert_count": revert_count,
         "mutual_revert_pairs": mutual_pairs,
+        "mutual_revert_count": mutual_count,
+        "raw_reverted_count": aggregate.raw_reverted_count,
+        "raw_revert_count": aggregate.raw_revert_count,
+        "talk_page_id": aggregate.talk_page_id,
+        "talk_edit_count": aggregate.talk_edit_count,
+        "talk_unique_editors": (
+            aggregate.talk_unique_editor_count
+            if aggregate.talk_unique_editor_count is not None
+            else len(aggregate.talk_editors)
+        ),
+        "talk_text_bytes": aggregate.talk_text_bytes,
         "revert_density": round(revert_density, 4),
+        "top_reverter_share": round(top_reverter_share, 4),
+        "strongest_pair_share": round(strongest_pair_share, 4),
     }
+    penalty = routine_update_penalty(row)
+    row["routine_penalty"] = round(penalty, 4)
+    row["candidate_score"] = round(float(row["peak_score"]) * (1.0 - penalty), 2)
+    return row
 
 
 def score_historical_page_windows(aggregate: PageHistoricalAggregate) -> dict[str, float | int]:
@@ -836,6 +1121,82 @@ def bidirectional_pair_strengths(edges: Counter[tuple[str, str]]) -> tuple[list[
     return strengths, participants
 
 
+def top_reverter_share_from_edges(edges: Counter[tuple[str, str]]) -> float:
+    revert_count = sum(edges.values())
+    if revert_count == 0:
+        return 0.0
+    reverter_counts: Counter[str] = Counter()
+    for (reverter, _), count in edges.items():
+        reverter_counts[reverter] += count
+    return max(reverter_counts.values()) / revert_count if reverter_counts else 0.0
+
+
+def strongest_bidirectional_pair_share(edges: Counter[tuple[str, str]]) -> float:
+    revert_count = sum(edges.values())
+    if revert_count == 0:
+        return 0.0
+    seen: set[frozenset[str]] = set()
+    strongest = 0
+    for (left, right), left_count in edges.items():
+        pair_key = frozenset({left, right})
+        if pair_key in seen:
+            continue
+        right_count = edges.get((right, left), 0)
+        if not right_count:
+            continue
+        seen.add(pair_key)
+        strongest = max(strongest, left_count + right_count)
+    return strongest / revert_count if strongest else 0.0
+
+
+def routine_update_penalty(row: dict[str, object]) -> float:
+    title = str(row.get("page_title") or "").replace("_", " ")
+    peak_score = float(row.get("peak_score") or 0.0)
+    edit_count = int(row.get("edit_count") or 0)
+    unique_editors = int(row.get("unique_editors") or 0)
+    revert_count = int(row.get("revert_count") or 0)
+    mutual_pairs = int(row.get("mutual_revert_pairs") or 0)
+    mutual_count = int(row.get("mutual_revert_count") or 0)
+    top_reverter_share = float(row.get("top_reverter_share") or 0.0)
+    strongest_pair_share = float(row.get("strongest_pair_share") or 0.0)
+    revert_density = float(row.get("revert_density") or 0.0)
+
+    penalty = 0.0
+    title_is_routine = bool(ROUTINE_UPDATE_TITLE_RE.search(title))
+    title_is_strong_routine = bool(STRONG_ROUTINE_UPDATE_TITLE_RE.search(title))
+    title_is_season = bool(SEASON_TITLE_RE.search(title))
+    if title_is_strong_routine:
+        penalty += 0.32
+    if title_is_routine:
+        penalty += 0.20
+    if title_is_season:
+        penalty += 0.14
+
+    if top_reverter_share >= 0.78 and revert_count >= 8:
+        penalty += 0.24
+    elif top_reverter_share >= 0.65 and revert_count >= 8:
+        penalty += 0.12
+
+    if strongest_pair_share >= 0.88 and mutual_pairs <= 1 and unique_editors <= 6:
+        penalty += 0.16
+    elif strongest_pair_share >= 0.75 and mutual_pairs <= 2 and unique_editors <= 10:
+        penalty += 0.08
+
+    if edit_count >= 80 and mutual_count <= 2:
+        penalty += 0.16
+    elif edit_count >= 45 and mutual_count <= 1:
+        penalty += 0.10
+
+    if title_is_strong_routine and mutual_pairs <= 4:
+        penalty += 0.16
+    elif title_is_routine and mutual_pairs <= 2:
+        penalty += 0.12
+    if title_is_routine and revert_density < 0.25 and peak_score < 160:
+        penalty += 0.10
+
+    return min(0.85, max(0.0, penalty))
+
+
 def mutual_revert_metrics_from_edges(edges: Counter[tuple[str, str]]) -> tuple[int, int]:
     seen: set[frozenset[str]] = set()
     pairs = 0
@@ -891,6 +1252,37 @@ def _timestamp(value: str) -> datetime | None:
         return None
 
 
+def local_history_dump_files(
+    *,
+    dump_dir: Path,
+    snapshot: str,
+    wiki: str,
+    start_partition: str | None = None,
+    stop_partition: str | None = None,
+) -> list[Path]:
+    prefix = f"{snapshot}.{wiki}."
+    suffix = ".tsv.bz2"
+    files = sorted(dump_dir.glob(f"{prefix}*{suffix}"))
+    result = []
+    for path in files:
+        partition = partition_from_history_dump_path(path, snapshot=snapshot, wiki=wiki)
+        if start_partition and partition < start_partition:
+            continue
+        if stop_partition and partition > stop_partition:
+            continue
+        result.append(path)
+    return result
+
+
+def partition_from_history_dump_path(path: Path, *, snapshot: str, wiki: str) -> str:
+    name = path.name
+    prefix = f"{snapshot}.{wiki}."
+    suffix = ".tsv.bz2"
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        raise ValueError(f"Unexpected mediawiki_history dump filename: {path}")
+    return name[len(prefix) : -len(suffix)]
+
+
 def log(message: str) -> None:
     print(f"{datetime.now(timezone.utc).isoformat()} {message}", flush=True)
 
@@ -925,6 +1317,20 @@ def main() -> None:
     process_parser.add_argument("--min-score", type=float, default=40.0)
     process_parser.add_argument("--namespace", type=int, default=0)
     process_parser.add_argument("--dry-run", action="store_true")
+
+    rebuild_local_parser = subparsers.add_parser(
+        "rebuild-local",
+        help="Reprocess already downloaded mediawiki_history partitions from local disk.",
+    )
+    rebuild_local_parser.add_argument("--snapshot", required=True)
+    rebuild_local_parser.add_argument("--wiki", default="enwiki")
+    rebuild_local_parser.add_argument("--dump-dir", type=Path, default=Path("data/dumps"))
+    rebuild_local_parser.add_argument("--period-prefix", default="history")
+    rebuild_local_parser.add_argument("--limit", type=int, default=100)
+    rebuild_local_parser.add_argument("--min-score", type=float, default=0.0)
+    rebuild_local_parser.add_argument("--start-partition")
+    rebuild_local_parser.add_argument("--stop-partition")
+    rebuild_local_parser.add_argument("--status-file", type=Path, default=Path("data/logs/method-rebuild-status.txt"))
 
     recompute_parser = subparsers.add_parser(
         "recompute",
@@ -981,6 +1387,40 @@ def main() -> None:
             f"period={result.period} rows_seen={result.rows_seen} "
             f"revisions_seen={result.revisions_seen} pages_scored={result.pages_scored} "
             f"rows_written={result.rows_written}"
+        )
+    elif args.command == "rebuild-local":
+        files = local_history_dump_files(
+            dump_dir=args.dump_dir,
+            snapshot=args.snapshot,
+            wiki=args.wiki,
+            start_partition=args.start_partition,
+            stop_partition=args.stop_partition,
+        )
+        args.status_file.parent.mkdir(parents=True, exist_ok=True)
+        for index, path in enumerate(files, start=1):
+            partition = partition_from_history_dump_path(path, snapshot=args.snapshot, wiki=args.wiki)
+            period = f"{args.period_prefix}:{args.snapshot}:{partition}"
+            args.status_file.write_text(
+                f"{datetime.now(timezone.utc).isoformat()} {index}/{len(files)} {period} {path}\n",
+                encoding="utf-8",
+            )
+            log(f"rebuild_local_start index={index}/{len(files)} period={period} path={path}")
+            result = process_history_files(
+                [path],
+                period=period,
+                limit=args.limit,
+                min_score=args.min_score,
+                namespace=0,
+                write=True,
+            )
+            log(
+                f"rebuild_local_done index={index}/{len(files)} period={period} "
+                f"rows_seen={result.rows_seen} revisions_seen={result.revisions_seen} "
+                f"pages_scored={result.pages_scored} rows_written={result.rows_written}"
+            )
+        args.status_file.write_text(
+            f"{datetime.now(timezone.utc).isoformat()} complete {len(files)}/{len(files)}\n",
+            encoding="utf-8",
         )
     elif args.command == "recompute":
         periods = recompute_scoreboard_from_aggregates(

@@ -23,12 +23,17 @@ from wikiwar.historical import (
     WIKI_DB,
     PageHistoricalAggregate,
     aggregate_to_record,
+    candidate_row_passes_min_score,
+    historical_year_most_discussed_scoreboard,
+    historical_year_page_war_scoreboard,
     dominant_reverted_user,
     effective_revert_edges,
     parse_history_row,
     process_history_files,
     probable_revert_only_cleanup_row,
+    rank_historical_rows,
     record_to_aggregate,
+    routine_update_penalty,
     score_historical_page,
 )
 from wikiwar.repository import (
@@ -232,6 +237,124 @@ def test_score_historical_page_does_not_promote_volume_without_reverts() -> None
     assert row["revert_count"] == 0
     assert row["peak_score"] < 40
     assert row["war_minutes"] == 0
+
+
+def test_routine_update_penalty_downranks_list_like_churn() -> None:
+    routine = historical_aggregate_with_activity(
+        page_id=1,
+        title="List of Example champions",
+        edit_count=90,
+        editor_count=5,
+        edge_counts={("Alice", "Bob"): 8, ("Bob", "Alice"): 4},
+    )
+    dispute = historical_aggregate_with_activity(
+        page_id=2,
+        title="National identity dispute",
+        edit_count=32,
+        editor_count=8,
+        edge_counts={("Alice", "Bob"): 6, ("Bob", "Alice"): 6, ("Carol", "Dave"): 4, ("Dave", "Carol"): 4},
+    )
+
+    routine_row = score_historical_page(routine)
+    dispute_row = score_historical_page(dispute)
+
+    assert routine_update_penalty(routine_row) > routine_update_penalty(dispute_row)
+    assert routine_row["candidate_score"] < routine_row["peak_score"]
+    assert dispute_row["candidate_score"] == dispute_row["peak_score"]
+
+
+def test_candidate_ranking_uses_adjusted_candidate_score() -> None:
+    routine = {
+        "peak_score": 100.0,
+        "candidate_score": 46.0,
+        "mutual_revert_pairs": 1,
+        "revert_count": 12,
+    }
+    semantic = {
+        "peak_score": 80.0,
+        "candidate_score": 80.0,
+        "mutual_revert_pairs": 2,
+        "revert_count": 16,
+    }
+
+    assert rank_historical_rows([routine, semantic], 2)[0] is semantic
+    assert not candidate_row_passes_min_score(routine, 60)
+    assert candidate_row_passes_min_score(semantic, 60)
+
+
+def test_page_war_method_promotes_raw_revert_activity_without_mutual_edges() -> None:
+    aggregate = PageHistoricalAggregate(wiki="enwiki", page_id=42, page_title="Gaza_war")
+    now = datetime(2023, 10, 7, tzinfo=timezone.utc)
+    for index in range(80):
+        revision = parse_history_row(
+            history_row(
+                rev_id=1000 + index,
+                user=f"Editor{index % 14}",
+                timestamp=now + timedelta(minutes=index),
+                is_reverted=index < 24,
+                is_revert=index % 5 == 0,
+            )
+        )
+        assert revision is not None
+        aggregate.add_revision(revision)
+
+    row = score_historical_page(aggregate)
+    record = aggregate_to_record(aggregate)
+
+    assert row["peak_score"] == 0
+    assert record is not None
+    assert record["raw_reverted_count"] == 24
+    assert record["raw_revert_count"] == 16
+
+
+def test_year_methods_rank_page_war_and_discussion(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'methods.db'}", future=True)
+    metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    article = historical_aggregate_with_activity(
+        page_id=1,
+        title="Gaza_war",
+        edit_count=120,
+        editor_count=20,
+        edge_counts={},
+    )
+    article.page_title = "Gaza_war"
+    article.raw_reverted_count = 32
+    article.raw_revert_count = 21
+    article.talk_page_id = 101
+    article.talk_edit_count = 90
+    article.talk_unique_editor_count = 30
+    article.talk_text_bytes = 480_000
+    pair_fight = historical_aggregate_with_activity(
+        page_id=2,
+        title="Pair_fight",
+        edit_count=30,
+        editor_count=4,
+        edge_counts={("Alice", "Bob"): 4, ("Bob", "Alice"): 4},
+    )
+    pair_fight.page_title = "Pair_fight"
+    article_record = aggregate_to_record(article)
+    pair_fight_record = aggregate_to_record(pair_fight)
+    assert article_record is not None
+    assert pair_fight_record is not None
+
+    with Session() as session:
+        replace_historical_aggregates(session, "history:2026-05:2023-10", [article_record, pair_fight_record])
+
+        page_war = historical_year_page_war_scoreboard(
+            session,
+            period="history-year:2026-05:2023",
+            limit=2,
+            min_score=0,
+        )
+        most_discussed = historical_year_most_discussed_scoreboard(
+            session,
+            period="history-year:2026-05:2023",
+            limit=2,
+        )
+
+    assert page_war[0]["page_title"] == "Gaza_war"
+    assert most_discussed[0]["page_title"] == "Gaza_war"
 
 
 def test_process_history_files_reconstructs_revert_edges(tmp_path) -> None:
