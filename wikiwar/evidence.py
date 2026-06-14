@@ -5,19 +5,28 @@ import bz2
 from dataclasses import dataclass, field
 from datetime import datetime
 import gzip
+from html.parser import HTMLParser
+import json
 from pathlib import Path
+import re
+import time
 from typing import Any, Iterable
 from xml.etree import ElementTree
+
+import httpx
 
 from .config import settings
 from .controversy import build_local_evidence_payload
 from .historical import (
+    parse_history_row,
     historical_year_scoreboard,
     rank_historical_rows,
     record_to_aggregate,
     score_historical_page,
 )
 from .repository import (
+    historical_month_periods,
+    historical_month_periods_for_year,
     historical_scoreboard,
     is_historical_year_period,
     load_historical_aggregates,
@@ -25,6 +34,13 @@ from .repository import (
 )
 from .schema import SessionLocal, init_db
 from .segments import period_bounds
+
+
+REVISION_DUMPS_BASE_URL = "https://dumps.wikimedia.org"
+DEFAULT_EVIDENCE_DUMP_DIR = Path("data/evidence-dumps")
+DEFAULT_EVIDENCE_STATUS_FILE = Path("data/logs/evidence-backfill-status.json")
+HISTORICAL_MONTH_RE = re.compile(r"^history:(?P<snapshot>\d{4}-\d{2}):(?P<month>\d{4}-\d{2})$")
+HISTORICAL_YEAR_RE = re.compile(r"^history-year:(?P<snapshot>\d{4}-\d{2}):(?P<year>\d{4})$")
 
 
 @dataclass
@@ -50,6 +66,27 @@ class EvidenceBackfillResult:
     candidates: int
     pages_with_article_revisions: int
     pages_written: int
+
+
+@dataclass(frozen=True)
+class RevisionDumpShard:
+    filename: str
+    url: str
+    start_page_id: int
+    end_page_id: int
+
+
+class DumpIndexParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.hrefs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "a":
+            return
+        href = dict(attrs).get("href")
+        if href:
+            self.hrefs.append(href)
 
 
 def candidate_rows_for_period(period: str, limit: int) -> list[dict[str, Any]]:
@@ -93,9 +130,17 @@ def backfill_local_evidence(
     dump_paths: list[Path],
     wiki: str = settings.wiki_db,
     limit: int = 100,
+    status_file: Path | None = None,
+    status: dict[str, Any] | None = None,
 ) -> EvidenceBackfillResult:
     candidates = evidence_inputs_from_rows(candidate_rows_for_period(period, limit), period, wiki)
-    collected = collect_revisions_from_xml_dumps(dump_paths, candidates, period)
+    collected = collect_revisions_from_xml_dumps(
+        dump_paths,
+        candidates,
+        period,
+        status_file=status_file,
+        status=status,
+    )
     pages_written = 0
     init_db()
     with SessionLocal() as session:
@@ -124,6 +169,16 @@ def backfill_local_evidence(
                 payload=payload,
             )
             pages_written += 1
+            if status_file and status:
+                write_evidence_status(
+                    status_file,
+                    {
+                        **status,
+                        "phase": "writing_cache",
+                        "pages_written": pages_written,
+                        "pages_with_article_revisions": sum(1 for revisions in collected.articles.values() if revisions),
+                    },
+                )
     return EvidenceBackfillResult(
         period=period,
         candidates=len(candidates),
@@ -132,10 +187,417 @@ def backfill_local_evidence(
     )
 
 
+def auto_backfill_local_evidence(
+    *,
+    periods: list[str],
+    wiki: str = settings.wiki_db,
+    limit: int = 20,
+    output_dir: Path = DEFAULT_EVIDENCE_DUMP_DIR,
+    history_dump_dir: Path = Path("data/dumps"),
+    status_file: Path = DEFAULT_EVIDENCE_STATUS_FILE,
+    include_talk: bool = False,
+) -> list[EvidenceBackfillResult]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    status_file.parent.mkdir(parents=True, exist_ok=True)
+    write_evidence_status(
+        status_file,
+        {
+            "status": "running",
+            "phase": "starting",
+            "periods": periods,
+            "periods_total": len(periods),
+            "periods_done": 0,
+            "limit": limit,
+            "wiki": wiki,
+            "output_dir": str(output_dir),
+            "include_talk": include_talk,
+        },
+    )
+
+    results: list[EvidenceBackfillResult] = []
+    for period_index, period in enumerate(periods, start=1):
+        snapshot = snapshot_from_period(period)
+        if not snapshot:
+            raise ValueError(f"Cannot determine snapshot from period: {period}")
+        candidates = evidence_inputs_from_rows(candidate_rows_for_period(period, limit), period, wiki)
+        write_evidence_status(
+            status_file,
+            {
+                "status": "running",
+                "phase": "resolving_candidates",
+                "periods": periods,
+                "periods_total": len(periods),
+                "periods_done": period_index - 1,
+                "current_period": period,
+                "candidates_total": len(candidates),
+                "limit": limit,
+                "wiki": wiki,
+                "include_talk": include_talk,
+            },
+        )
+
+        talk_page_ids = (
+            talk_page_ids_from_history_dumps(
+                candidates,
+                period=period,
+                wiki=wiki,
+                history_dump_dir=history_dump_dir,
+            )
+            if include_talk
+            else {}
+        )
+        target_page_ids = {candidate.page_id for candidate in candidates}
+        target_page_ids.update(talk_page_ids.values())
+        shards = revision_shards_for_page_ids(
+            list_revision_dump_shards(snapshot=snapshot, wiki=wiki),
+            target_page_ids,
+        )
+        write_evidence_status(
+            status_file,
+            {
+                "status": "running",
+                "phase": "downloading_shards",
+                "periods": periods,
+                "periods_total": len(periods),
+                "periods_done": period_index - 1,
+                "current_period": period,
+                "candidates_total": len(candidates),
+                "talk_pages_found": len(talk_page_ids),
+                "target_page_ids": len(target_page_ids),
+                "shards_total": len(shards),
+                "shards_done": 0,
+                "limit": limit,
+                "wiki": wiki,
+                "include_talk": include_talk,
+            },
+        )
+        dump_paths: list[Path] = []
+        for shard_index, shard in enumerate(shards, start=1):
+            path = download_revision_dump_shard(
+                shard,
+                output_dir=output_dir,
+                status_file=status_file,
+                status={
+                    "status": "running",
+                    "phase": "downloading_shards",
+                    "periods": periods,
+                    "periods_total": len(periods),
+                    "periods_done": period_index - 1,
+                    "current_period": period,
+                    "candidates_total": len(candidates),
+                    "talk_pages_found": len(talk_page_ids),
+                    "target_page_ids": len(target_page_ids),
+                    "shards_total": len(shards),
+                    "shards_done": shard_index - 1,
+                    "current_shard": shard.filename,
+                    "limit": limit,
+                    "wiki": wiki,
+                    "include_talk": include_talk,
+                },
+            )
+            dump_paths.append(path)
+            write_evidence_status(
+                status_file,
+                {
+                    "status": "running",
+                    "phase": "downloading_shards",
+                    "periods": periods,
+                    "periods_total": len(periods),
+                    "periods_done": period_index - 1,
+                    "current_period": period,
+                    "candidates_total": len(candidates),
+                    "talk_pages_found": len(talk_page_ids),
+                    "target_page_ids": len(target_page_ids),
+                    "shards_total": len(shards),
+                    "shards_done": shard_index,
+                    "current_shard": shard.filename,
+                    "limit": limit,
+                    "wiki": wiki,
+                    "include_talk": include_talk,
+                },
+            )
+
+        write_evidence_status(
+            status_file,
+            {
+                "status": "running",
+                "phase": "parsing_shards",
+                "periods": periods,
+                "periods_total": len(periods),
+                "periods_done": period_index - 1,
+                "current_period": period,
+                "candidates_total": len(candidates),
+                "talk_pages_found": len(talk_page_ids),
+                "target_page_ids": len(target_page_ids),
+                "shards_total": len(shards),
+                "shards_done": len(shards),
+                "limit": limit,
+                "wiki": wiki,
+                "include_talk": include_talk,
+            },
+        )
+        result = backfill_local_evidence(
+            period=period,
+            dump_paths=dump_paths,
+            wiki=wiki,
+            limit=limit,
+            status_file=status_file,
+            status={
+                "status": "running",
+                "phase": "parsing_shards",
+                "periods": periods,
+                "periods_total": len(periods),
+                "periods_done": period_index - 1,
+                "current_period": period,
+                "candidates_total": len(candidates),
+                "talk_pages_found": len(talk_page_ids),
+                "target_page_ids": len(target_page_ids),
+                "shards_total": len(shards),
+                "shards_done": len(shards),
+                "limit": limit,
+                "wiki": wiki,
+                "include_talk": include_talk,
+            },
+        )
+        results.append(result)
+        write_evidence_status(
+            status_file,
+            {
+                "status": "running",
+                "phase": "period_done",
+                "periods": periods,
+                "periods_total": len(periods),
+                "periods_done": period_index,
+                "current_period": period,
+                "candidates_total": result.candidates,
+                "pages_with_article_revisions": result.pages_with_article_revisions,
+                "pages_written": result.pages_written,
+                "shards_total": len(shards),
+                "shards_done": len(shards),
+                "limit": limit,
+                "wiki": wiki,
+                "include_talk": include_talk,
+            },
+        )
+
+    write_evidence_status(
+        status_file,
+        {
+            "status": "complete",
+            "phase": "complete",
+            "periods": periods,
+            "periods_total": len(periods),
+            "periods_done": len(periods),
+            "results": [result.__dict__ for result in results],
+            "limit": limit,
+            "wiki": wiki,
+            "include_talk": include_talk,
+        },
+    )
+    return results
+
+
+def snapshot_from_period(period: str) -> str:
+    month_match = HISTORICAL_MONTH_RE.match(period)
+    if month_match:
+        return month_match.group("snapshot")
+    year_match = HISTORICAL_YEAR_RE.match(period)
+    if year_match:
+        return year_match.group("snapshot")
+    return ""
+
+
+def xml_snapshot_id(snapshot: str) -> str:
+    match = re.match(r"^(\d{4})-(\d{2})$", snapshot)
+    if not match:
+        raise ValueError(f"Snapshot must be YYYY-MM: {snapshot}")
+    return f"{match.group(1)}{match.group(2)}01"
+
+
+def list_revision_dump_shards(*, snapshot: str, wiki: str = settings.wiki_db) -> list[RevisionDumpShard]:
+    snapshot_id = xml_snapshot_id(snapshot)
+    base_url = f"{REVISION_DUMPS_BASE_URL}/{wiki}/{snapshot_id}/"
+    with httpx.Client(headers={"User-Agent": settings.user_agent}, timeout=30.0) as client:
+        response = client.get(base_url)
+        response.raise_for_status()
+        index_html = response.text
+    parser = DumpIndexParser()
+    parser.feed(index_html)
+    pattern = re.compile(
+        rf"^{re.escape(wiki)}-{re.escape(snapshot_id)}-pages-meta-history\d+\.xml-"
+        r"p(?P<start>\d+)p(?P<end>\d+)\.bz2$"
+    )
+    seen: set[str] = set()
+    shards: list[RevisionDumpShard] = []
+    for href in parser.hrefs:
+        filename = href.rsplit("/", 1)[-1]
+        if filename in seen:
+            continue
+        seen.add(filename)
+        match = pattern.match(filename)
+        if not match:
+            continue
+        shards.append(
+            RevisionDumpShard(
+                filename=filename,
+                url=f"{base_url}{filename}",
+                start_page_id=int(match.group("start")),
+                end_page_id=int(match.group("end")),
+            )
+        )
+    shards.sort(key=lambda shard: (shard.start_page_id, shard.end_page_id, shard.filename))
+    return shards
+
+
+def revision_shards_for_page_ids(
+    shards: list[RevisionDumpShard],
+    page_ids: Iterable[int],
+) -> list[RevisionDumpShard]:
+    selected: dict[str, RevisionDumpShard] = {}
+    for page_id in sorted({int(page_id) for page_id in page_ids if int(page_id) > 0}):
+        shard = revision_shard_for_page_id(shards, page_id)
+        if shard:
+            selected[shard.filename] = shard
+    return sorted(selected.values(), key=lambda shard: (shard.start_page_id, shard.end_page_id, shard.filename))
+
+
+def revision_shard_for_page_id(shards: list[RevisionDumpShard], page_id: int) -> RevisionDumpShard | None:
+    for shard in shards:
+        if shard.start_page_id <= page_id <= shard.end_page_id:
+            return shard
+    return None
+
+
+def download_revision_dump_shard(
+    shard: RevisionDumpShard,
+    *,
+    output_dir: Path,
+    status_file: Path | None = None,
+    status: dict[str, Any] | None = None,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    target = output_dir / shard.filename
+    if target.exists() and target.stat().st_size > 0:
+        return target
+
+    partial = target.with_suffix(target.suffix + ".part")
+    resume_from = partial.stat().st_size if partial.exists() else 0
+    headers = {"User-Agent": settings.user_agent}
+    if resume_from > 0:
+        headers["Range"] = f"bytes={resume_from}-"
+
+    downloaded = resume_from
+    total_bytes = 0
+    last_status_at = 0.0
+    with httpx.Client(headers=headers, timeout=None, follow_redirects=True) as client:
+        with client.stream("GET", shard.url) as response:
+            response.raise_for_status()
+            if response.status_code != 206 and resume_from:
+                resume_from = 0
+                downloaded = 0
+            total_header = response.headers.get("Content-Length")
+            if total_header and total_header.isdigit():
+                total_bytes = int(total_header) + (resume_from if response.status_code == 206 else 0)
+            mode = "ab" if response.status_code == 206 and resume_from else "wb"
+            with partial.open(mode) as file:
+                for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    file.write(chunk)
+                    downloaded += len(chunk)
+                    now = time.monotonic()
+                    if status_file and status and now - last_status_at >= 5:
+                        last_status_at = now
+                        write_evidence_status(
+                            status_file,
+                            {
+                                **status,
+                                "current_shard_downloaded_bytes": downloaded,
+                                "current_shard_total_bytes": total_bytes,
+                            },
+                        )
+    partial.replace(target)
+    return target
+
+
+def talk_page_ids_from_history_dumps(
+    candidates: list[CandidateEvidenceInput],
+    *,
+    period: str,
+    wiki: str,
+    history_dump_dir: Path,
+) -> dict[int, int]:
+    candidate_by_title = {normalize_title(candidate.page_title): candidate for candidate in candidates}
+    if not candidate_by_title:
+        return {}
+    paths = history_dump_paths_for_period(period=period, wiki=wiki, history_dump_dir=history_dump_dir)
+    result: dict[int, int] = {}
+    for path in paths:
+        if not path.exists():
+            continue
+        with bz2.open(path, "rt", encoding="utf-8", newline="") as file:
+            for line in file:
+                revision = parse_history_row(line.rstrip("\n").split("\t"), namespace=1)
+                if revision is None:
+                    continue
+                candidate = candidate_by_title.get(normalize_title(revision.page_title))
+                if not candidate:
+                    continue
+                result.setdefault(candidate.page_id, revision.page_id)
+                if len(result) == len(candidate_by_title):
+                    return result
+    return result
+
+
+def history_dump_paths_for_period(*, period: str, wiki: str, history_dump_dir: Path) -> list[Path]:
+    month_match = HISTORICAL_MONTH_RE.match(period)
+    if month_match:
+        snapshot = month_match.group("snapshot")
+        month = month_match.group("month")
+        return [history_dump_dir / f"{snapshot}.{wiki}.{month}.tsv.bz2"]
+
+    if is_historical_year_period(period):
+        with SessionLocal() as session:
+            months = historical_month_periods_for_year(historical_month_periods(session), period)
+        return [history_dump_paths_for_period(period=month, wiki=wiki, history_dump_dir=history_dump_dir)[0] for month in months]
+    return []
+
+
+def write_evidence_status(status_file: Path, payload: dict[str, Any]) -> None:
+    status_file.parent.mkdir(parents=True, exist_ok=True)
+    status = {
+        **payload,
+        "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    temporary = status_file.with_suffix(status_file.suffix + ".tmp")
+    temporary.write_text(json.dumps(status, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(status_file)
+
+
+def read_evidence_status(status_file: Path = DEFAULT_EVIDENCE_STATUS_FILE) -> dict[str, Any]:
+    if not status_file.exists():
+        return {
+            "status": "not_started",
+            "phase": "not_started",
+            "message": "No evidence backfill status file exists yet.",
+        }
+    try:
+        return json.loads(status_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return {
+            "status": "unreadable",
+            "phase": "unreadable",
+            "message": str(exc),
+        }
+
+
 def collect_revisions_from_xml_dumps(
     dump_paths: list[Path],
     candidates: list[CandidateEvidenceInput],
     period: str,
+    *,
+    status_file: Path | None = None,
+    status: dict[str, Any] | None = None,
 ) -> CollectedEvidenceRevisions:
     start, end = period_bounds(period)
     if start is None or end is None:
@@ -148,8 +610,27 @@ def collect_revisions_from_xml_dumps(
         for candidate in candidates
     }
     collected = CollectedEvidenceRevisions()
-    for path in dump_paths:
+    for path_index, path in enumerate(dump_paths, start=1):
+        pages_seen = 0
+        last_status_at = 0.0
         for page in iter_mediawiki_xml_pages(path):
+            pages_seen += 1
+            now = time.monotonic()
+            if status_file and status and now - last_status_at >= 5:
+                last_status_at = now
+                write_evidence_status(
+                    status_file,
+                    {
+                        **status,
+                        "phase": "parsing_shards",
+                        "parse_shards_done": path_index - 1,
+                        "parse_shards_total": len(dump_paths),
+                        "current_parse_shard": path.name,
+                        "current_parse_pages_seen": pages_seen,
+                        "article_pages_found": len(collected.articles),
+                        "talk_pages_found_in_xml": len(collected.talks),
+                    },
+                )
             title = str(page.get("title") or "")
             namespace = int(page.get("namespace") or 0)
             page_id = int(page.get("page_id") or 0)
@@ -168,6 +649,20 @@ def collect_revisions_from_xml_dumps(
                 revisions = revisions_in_period(page.get("revisions") or [], start, end)
                 if revisions:
                     collected.talks.setdefault(candidate.page_id, []).extend(revisions)
+        if status_file and status:
+            write_evidence_status(
+                status_file,
+                {
+                    **status,
+                    "phase": "parsing_shards",
+                    "parse_shards_done": path_index,
+                    "parse_shards_total": len(dump_paths),
+                    "current_parse_shard": path.name,
+                    "current_parse_pages_seen": pages_seen,
+                    "article_pages_found": len(collected.articles),
+                    "talk_pages_found_in_xml": len(collected.talks),
+                },
+            )
     for revisions in collected.articles.values():
         revisions.sort(key=lambda item: (str(item.get("timestamp") or ""), int(item.get("rev_id") or 0)))
     for revisions in collected.talks.values():
@@ -298,6 +793,31 @@ def main() -> None:
         help="Local MediaWiki pages-meta-history XML dump. Pass multiple times for article and talk dump shards.",
     )
 
+    auto_parser = subparsers.add_parser(
+        "auto-backfill",
+        help="Download needed revision XML shards and backfill local evidence for selected historical periods.",
+    )
+    auto_parser.add_argument(
+        "--period",
+        dest="periods",
+        action="append",
+        required=True,
+        help="Historical period to populate. Pass multiple times for multiple years/months.",
+    )
+    auto_parser.add_argument("--wiki", default=settings.wiki_db)
+    auto_parser.add_argument("--limit", type=int, default=20)
+    auto_parser.add_argument("--output-dir", type=Path, default=DEFAULT_EVIDENCE_DUMP_DIR)
+    auto_parser.add_argument("--history-dump-dir", type=Path, default=Path("data/dumps"))
+    auto_parser.add_argument("--status-file", type=Path, default=DEFAULT_EVIDENCE_STATUS_FILE)
+    auto_parser.add_argument(
+        "--include-talk",
+        action="store_true",
+        help="Also scan local mediawiki_history TSVs for talk-page IDs and download their XML shards.",
+    )
+
+    status_parser = subparsers.add_parser("status", help="Print the latest evidence backfill status JSON.")
+    status_parser.add_argument("--status-file", type=Path, default=DEFAULT_EVIDENCE_STATUS_FILE)
+
     args = parser.parse_args()
     if args.command == "backfill":
         result = backfill_local_evidence(
@@ -310,6 +830,23 @@ def main() -> None:
             "period={period} candidates={candidates} pages_with_article_revisions={pages_with_article_revisions} "
             "pages_written={pages_written}".format(**result.__dict__)
         )
+    elif args.command == "auto-backfill":
+        results = auto_backfill_local_evidence(
+            periods=args.periods,
+            wiki=args.wiki,
+            limit=args.limit,
+            output_dir=args.output_dir,
+            history_dump_dir=args.history_dump_dir,
+            status_file=args.status_file,
+            include_talk=args.include_talk,
+        )
+        for result in results:
+            print(
+                "period={period} candidates={candidates} pages_with_article_revisions={pages_with_article_revisions} "
+                "pages_written={pages_written}".format(**result.__dict__)
+            )
+    elif args.command == "status":
+        print(json.dumps(read_evidence_status(args.status_file), indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

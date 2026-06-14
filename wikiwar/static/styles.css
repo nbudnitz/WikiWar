@@ -214,7 +214,32 @@ th {
 .scoreboard-table .scoreboard-page-cell {
   min-width: 0;
   overflow: hidden;
+  white-space: normal;
+}
+
+.scoreboard-page-title {
+  overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scoreboard-rank-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+  min-width: 0;
+}
+
+.scoreboard-rank-pill {
+  background: #eef2f7;
+  border: 1px solid #d6dde8;
+  color: #374151;
+  display: inline-flex;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 4px 6px;
   white-space: nowrap;
 }
 

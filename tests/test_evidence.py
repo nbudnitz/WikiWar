@@ -8,12 +8,78 @@ from sqlalchemy.orm import sessionmaker
 from wikiwar import app as wikiwar_app
 from wikiwar.controversy import build_local_evidence_payload
 from wikiwar.evidence import CandidateEvidenceInput, collect_revisions_from_xml_dumps
+from wikiwar.evidence import (
+    RevisionDumpShard,
+    read_evidence_status,
+    revision_shards_for_page_ids,
+    talk_page_ids_from_history_dumps,
+    write_evidence_status,
+)
+from wikiwar.historical import (
+    EVENT_ENTITY,
+    EVENT_TIMESTAMP,
+    EVENT_TYPE,
+    EVENT_USER_TEXT,
+    PAGE_ID,
+    PAGE_NAMESPACE_HISTORICAL,
+    PAGE_TITLE,
+    REVISION_ID,
+    WIKI_DB,
+)
 from wikiwar.repository import (
     apply_cached_historical_evidence,
     load_historical_evidence,
     save_historical_evidence,
 )
 from wikiwar.schema import metadata
+
+
+def test_revision_shards_for_page_ids_dedupes_matching_ranges() -> None:
+    shards = [
+        RevisionDumpShard("a.bz2", "https://example.test/a.bz2", 1, 100),
+        RevisionDumpShard("b.bz2", "https://example.test/b.bz2", 101, 200),
+        RevisionDumpShard("c.bz2", "https://example.test/c.bz2", 201, 300),
+    ]
+
+    selected = revision_shards_for_page_ids(shards, [15, 20, 175, 999])
+
+    assert [shard.filename for shard in selected] == ["a.bz2", "b.bz2"]
+
+
+def test_talk_page_ids_from_local_history_dumps(tmp_path: Path) -> None:
+    path = tmp_path / "2026-05.enwiki.2017-01.tsv.bz2"
+    row = history_tsv_row(page_id=43, page_title="Example", namespace=1, rev_id=101)
+    import bz2
+
+    with bz2.open(path, "wt", encoding="utf-8") as file:
+        file.write("\t".join(row) + "\n")
+
+    result = talk_page_ids_from_history_dumps(
+        [
+            CandidateEvidenceInput(
+                wiki="enwiki",
+                page_id=42,
+                page_title="Example",
+                period="history:2026-05:2017-01",
+            )
+        ],
+        period="history:2026-05:2017-01",
+        wiki="enwiki",
+        history_dump_dir=tmp_path,
+    )
+
+    assert result == {42: 43}
+
+
+def test_evidence_status_round_trips(tmp_path: Path) -> None:
+    status_file = tmp_path / "status.json"
+
+    write_evidence_status(status_file, {"status": "running", "phase": "downloading"})
+
+    status = read_evidence_status(status_file)
+    assert status["status"] == "running"
+    assert status["phase"] == "downloading"
+    assert status["updated_at"].endswith("Z")
 
 
 def test_collects_article_and_talk_revisions_from_local_xml_dump(tmp_path: Path) -> None:
@@ -89,6 +155,8 @@ def test_historical_evidence_cache_round_trips_and_overlays_scoreboard_rows() ->
         "segments": [{"segment": "dictator"}],
         "controversy": {
             "score": 207.47,
+            "battle_score": 77.97,
+            "talk_score": 42.0,
             "battle_count": 1,
             "talk_evidence_count": 1,
         },
@@ -126,6 +194,8 @@ def test_historical_evidence_cache_round_trips_and_overlays_scoreboard_rows() ->
     assert cached is not None
     assert cached["payload"]["source"] == "local_revision_dump"
     assert rows[0]["controversy_score"] == 207.47
+    assert rows[0]["battle_score"] == 77.97
+    assert rows[0]["talk_score"] == 42.0
     assert rows[0]["battle_count"] == 1
     assert rows[0]["talk_evidence_count"] == 1
     assert rows[0]["local_evidence_source"] == "local_revision_dump"
@@ -229,3 +299,17 @@ def sample_revision_dump(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+def history_tsv_row(*, page_id: int, page_title: str, namespace: int, rev_id: int) -> list[str]:
+    row = [""] * 78
+    row[WIKI_DB] = "enwiki"
+    row[EVENT_ENTITY] = "revision"
+    row[EVENT_TYPE] = "create"
+    row[EVENT_TIMESTAMP] = "2017-01-01 00:00:00.0"
+    row[EVENT_USER_TEXT] = "TalkEditor"
+    row[PAGE_ID] = str(page_id)
+    row[PAGE_TITLE] = page_title
+    row[PAGE_NAMESPACE_HISTORICAL] = str(namespace)
+    row[REVISION_ID] = str(rev_id)
+    return row

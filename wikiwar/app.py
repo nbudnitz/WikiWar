@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import settings
 from .controversy import enrich_segments_payload
+from .evidence import read_evidence_status
 from .historical import historical_year_scoreboard
 from .ingest import run_eventstream_ingest
 from .repository import (
@@ -126,6 +127,11 @@ def historical_snapshot_scoreboard(
     selected_period = rows[0]["period"] if rows else selected_period
     rows = rows[:limit]
     return {"period": selected_period, "rows": serialize(rows)}
+
+
+@app.get("/api/historical/evidence/status")
+def historical_evidence_status() -> dict[str, Any]:
+    return read_evidence_status()
 
 
 @app.get("/api/scoreboard/segments")

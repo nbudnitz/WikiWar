@@ -656,6 +656,10 @@ def apply_cached_historical_evidence(
         if payload:
             controversy = payload.get("controversy") or {}
             item["controversy_score"] = round(float(controversy.get("score") or 0.0), 2)
+            item["battle_score"] = round(float(controversy.get("battle_score") or 0.0), 2)
+            item["talk_score"] = round(float(controversy.get("talk_score") or 0.0), 2)
+            item["metadata_score"] = round(float(controversy.get("metadata_score") or 0.0), 2)
+            item["cleanup_penalty"] = round(float(controversy.get("cleanup_penalty") or 0.0), 2)
             item["battle_count"] = int(controversy.get("battle_count") or len(payload.get("segments") or []))
             item["talk_evidence_count"] = int(controversy.get("talk_evidence_count") or 0)
             item["local_evidence_source"] = payload.get("source") or "local_cache"

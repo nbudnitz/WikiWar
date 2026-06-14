@@ -211,7 +211,7 @@ async function loadScoreboard() {
     : await fetch(`/api/scoreboard?hours=${value.replace("live:", "")}`);
   const payload = await response.json();
   document.getElementById("scoreboardTable").classList.toggle("is-historical", isHistorical);
-  document.getElementById("scoreboardScoreHeader").textContent = isHistorical ? "Controversy" : "Conflict Score";
+  document.getElementById("scoreboardScoreHeader").textContent = "Score";
   document.getElementById("scoreboardMetricA").textContent = isHistorical ? "Evidence" : "Reverts";
   document.getElementById("scoreboardMetricB").textContent = "Participants";
   document.getElementById("scoreboardMetricC").textContent = "Status";
@@ -229,7 +229,7 @@ async function loadScoreboard() {
     tr.className = "scoreboard-row";
     tr.innerHTML = `
         <td class="scoreboard-score-cell">${fmt.format(score)}</td>
-        <td class="scoreboard-page-cell" title="${escapeHtml(row.page_title)}">${escapeHtml(row.page_title)}</td>
+        ${scoreboardPageCellHtml(row, isHistorical, score)}
         <td class="scoreboard-metric-cell">${metricA}</td>
         ${isHistorical ? "" : `<td class="scoreboard-participants-cell">${row.participants}</td>`}
         ${isHistorical ? "" : `<td class="scoreboard-status-cell">${escapeHtml(String(row.status || ""))}</td>`}
@@ -237,6 +237,34 @@ async function loadScoreboard() {
     tr.addEventListener("click", () => toggleScoreboardSegments(tr, row, isHistorical, selectedPeriod));
     rows.appendChild(tr);
   });
+}
+
+function scoreboardPageCellHtml(row, isHistorical, score) {
+  return `
+    <td class="scoreboard-page-cell" title="${escapeHtml(row.page_title)}">
+      <div class="scoreboard-page-title">${escapeHtml(row.page_title)}</div>
+      ${isHistorical ? scoreboardRankingMetricsHtml(row, score) : ""}
+    </td>
+  `;
+}
+
+function scoreboardRankingMetricsHtml(row, score) {
+  return `
+    <div class="scoreboard-rank-metrics" aria-label="Historical ranking evidence">
+      ${rankingMetricHtml("Score", score)}
+      ${rankingMetricHtml("Battle", row.battle_score)}
+      ${rankingMetricHtml("Talk", row.talk_score)}
+    </div>
+  `;
+}
+
+function rankingMetricHtml(labelText, value) {
+  return `<span class="scoreboard-rank-pill">${labelText} ${formatOptionalMetric(value)}</span>`;
+}
+
+function formatOptionalMetric(value) {
+  if (value === null || value === undefined || value === "") return "--";
+  return fmt.format(Number(value || 0));
 }
 
 function scoreboardColumnCount(isHistorical) {
@@ -370,7 +398,7 @@ function controversyEvidenceHtml(controversy) {
   return `
     <div class="controversy-evidence">
       <div class="controversy-metrics" aria-label="Controversy evidence">
-        <span>Controversy ${fmt.format(controversy.score || 0)}</span>
+        <span>Score ${fmt.format(controversy.score || 0)}</span>
         <span>Battle ${fmt.format(controversy.battle_score || 0)}</span>
         <span>Talk ${fmt.format(controversy.talk_score || 0)}</span>
         ${controversy.cleanup_penalty ? `<span>Cleanup penalty ${fmt.format(controversy.cleanup_penalty)}</span>` : ""}

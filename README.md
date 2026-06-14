@@ -131,6 +131,29 @@ python -m wikiwar.evidence backfill \
 
 Pass every XML shard needed to cover the candidate article pages and their talk pages. The evidence backfill streams/decompresses the dump files, extracts only the selected period, writes compact `historical_evidence_cache` rows, and does not call the MediaWiki API. Historical scoreboard drill-downs use this cache by default; if no local evidence exists yet, the UI reports that the page/period has not been backfilled. Use `allow_api_fallback=true` on `/api/scoreboard/segments` only for deliberate spot checks.
 
+For a targeted, resumable run that discovers and downloads only the needed article XML shards for the selected scoreboard candidates:
+
+```sh
+mkdir -p data/logs data/evidence-dumps
+nohup python -m wikiwar.evidence auto-backfill \
+  --period history-year:2026-05:2017 \
+  --limit 20 \
+  --output-dir data/evidence-dumps \
+  --history-dump-dir data/dumps \
+  > data/logs/evidence-backfill.log 2>&1 &
+echo $! > data/logs/evidence-backfill.pid
+```
+
+Add `--include-talk` to also scan local `mediawiki_history` TSVs for matching talk-page IDs and download those XML shards. That is slower because it has to decompress local monthly history partitions.
+
+Monitor evidence population:
+
+```sh
+tail -f data/logs/evidence-backfill.log
+python -m wikiwar.evidence status
+curl -s http://127.0.0.1:8000/api/historical/evidence/status
+```
+
 Monitor long historical jobs:
 
 ```sh
