@@ -19,6 +19,16 @@ CLEANUP_RE = re.compile(
     r"\b(vandal(?:ism|s)?|rvv|graffiti|blank(?:ing|ed)?|test edit|nonsense|spam|hoax|unconstructive)\b",
     re.IGNORECASE,
 )
+GENERATED_REVISION_COMMENT_RE = re.compile(
+    r"(?:^|\b)(?:undid|undo|reverted|revert|rollback)\b[^\n]{0,140}\brevision\s+\d+\b"
+    r"|^\s*revision\s+\d+\s+by\s*(?:\([^)]*\))?\s*$"
+    r"|^\s*reverted\s+(?:\d+\s+)?edits?\s+by\b",
+    re.IGNORECASE,
+)
+GENERIC_COMMENT_ACTION_RE = re.compile(
+    r"^(?:rvv?|revert(?:ed|ing)?|undo|undid|rollback|restore(?:d)?|copyedit|ce|cleanup|fix(?:ed)?)\b[:\s-]*",
+    re.IGNORECASE,
+)
 WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’\-–]*")
 WIKILINK_RE = re.compile(r"\[\[(?:[^|\]]*\|)?([^\]]+)\]\]")
 TEMPLATE_RE = re.compile(r"\{\{[^{}]*\}\}")
@@ -357,8 +367,8 @@ def top_contested_revision_pairs(
             for value in snippet.get("swap_values", []):
                 item["swap_values"][value] += 1
             item["changes"] += 1
-            first_shot = first_sentence(previous_comment if current_is_revert else current_comment)
-            if first_shot and not is_cleanup_like_comment(first_shot) and not item["first_shot_comment"]:
+            first_shot = substantive_first_shot_comment(previous_comment if current_is_revert else current_comment)
+            if first_shot and not item["first_shot_comment"]:
                 item["first_shot_comment"] = first_shot
             for comment in (previous_comment, current_comment):
                 if comment:
@@ -442,6 +452,44 @@ def first_sentence(value: str) -> str:
     if match:
         return match.group(1).strip()
     return cleaned[:240].strip()
+
+
+def substantive_first_shot_comment(value: str) -> str:
+    if not value:
+        return ""
+    cleaned = first_sentence(value)
+    if not cleaned:
+        return ""
+    if is_cleanup_like_comment(cleaned):
+        return ""
+    if is_generated_revision_comment(value) or is_generated_revision_comment(cleaned):
+        return ""
+    if not has_substantive_comment_text(cleaned):
+        return ""
+    return cleaned
+
+
+def is_generated_revision_comment(value: str) -> bool:
+    raw = html.unescape(value or "")
+    raw = TAG_RE.sub(" ", raw)
+    cleaned = clean_comment(value)
+    return bool(
+        GENERATED_REVISION_COMMENT_RE.search(raw)
+        or GENERATED_REVISION_COMMENT_RE.search(cleaned)
+    )
+
+
+def has_substantive_comment_text(value: str) -> bool:
+    stripped = GENERIC_COMMENT_ACTION_RE.sub("", value or "").strip()
+    if not stripped:
+        return False
+    words = [
+        word.lower()
+        for word in WORD_RE.findall(stripped)
+        if not word.isdigit()
+    ]
+    content_words = [word for word in words if word not in STOPWORDS]
+    return len(content_words) >= 3
 
 
 def clean_comment(value: str) -> str:
@@ -577,7 +625,8 @@ def opcode_segments(
         before_candidate = candidate_segment(before_tokens, before_text, left_start, left_end)
         after_candidate = candidate_segment(after_tokens, after_text, right_start, right_end)
         if before_candidate and after_candidate:
-            return [swap_segment(before_candidate, after_candidate)]
+            candidate = swap_segment(before_candidate, after_candidate)
+            return [candidate] if candidate else []
         if before_candidate:
             before_candidate["change_type"] = "deletion"
             return [before_candidate]
@@ -603,6 +652,9 @@ def opcode_segments(
 def candidate_segment(tokens: list[WordToken], source: str, start: int, end: int) -> dict[str, Any] | None:
     words = [token.text for token in tokens[start:end] if WORD_RE.fullmatch(token.text)]
     if not words:
+        return None
+    changed_text = token_fragment(source, tokens, start, end)
+    if is_graffiti_like_segment_text(changed_text):
         return None
     changed_word_count = len(words)
     if len(words) == 1:
@@ -638,6 +690,8 @@ def candidate_segment(tokens: list[WordToken], source: str, start: int, end: int
 def swap_segment(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
     before_text = str(before["changed_text"])
     after_text = str(after["changed_text"])
+    if is_graffiti_like_segment_text(before_text) or is_graffiti_like_segment_text(after_text):
+        return {}
     values = unique_phrases([before_text, after_text])
     result = dict(after)
     result["change_type"] = "swap"
@@ -668,6 +722,36 @@ def unique_phrases(values: list[str]) -> list[str]:
             seen.add(normalized)
             result.append(value)
     return result
+
+
+def is_graffiti_like_segment_text(value: str) -> bool:
+    compact = re.sub(r"[^A-Za-z0-9]+", "", value or "").lower()
+    if len(compact) >= 40 and not any(char.isdigit() for char in compact) and repeated_unit_ratio(compact) >= 0.82:
+        return True
+
+    words = [word.lower() for word in WORD_RE.findall(value or "")]
+    if len(words) >= 8:
+        top_count = Counter(words).most_common(1)[0][1]
+        if top_count / len(words) >= 0.7:
+            return True
+
+    long_words = [word.lower() for word in words if len(word) >= 40]
+    return any(repeated_unit_ratio(word) >= 0.82 for word in long_words)
+
+
+def repeated_unit_ratio(value: str) -> float:
+    if not value:
+        return 0.0
+    best = 0.0
+    max_unit = min(24, max(1, len(value) // 2))
+    for size in range(1, max_unit + 1):
+        unit = value[:size]
+        if not unit:
+            continue
+        repeated = (unit * ((len(value) // size) + 1))[: len(value)]
+        matches = sum(1 for left, right in zip(value, repeated) if left == right)
+        best = max(best, matches / len(value))
+    return best
 
 
 def expanded_phrase_bounds(tokens: list[WordToken], start: int, end: int) -> tuple[int, int]:
@@ -867,6 +951,10 @@ def revision_content(revision: dict[str, Any]) -> str:
 def period_bounds(period: str | None) -> tuple[datetime | None, datetime | None]:
     if not period:
         return None, None
+    year_match = re.match(r"^history-year:\d{4}-\d{2}:(\d{4})$", period)
+    if year_match:
+        year = int(year_match.group(1))
+        return datetime(year, 1, 1, tzinfo=timezone.utc), datetime(year + 1, 1, 1, tzinfo=timezone.utc)
     matches = re.findall(r"\d{4}-\d{2}", period)
     if not matches:
         return None, None

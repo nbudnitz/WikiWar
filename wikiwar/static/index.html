@@ -93,7 +93,7 @@
                 <option value="live:24" selected>Last 24 hours</option>
                 <option value="live:168">Last 7 days</option>
               </optgroup>
-              <optgroup id="historicalPeriods" label="Historical snapshots"></optgroup>
+              <optgroup id="historicalPeriods" label="Historical years"></optgroup>
             </select>
           </div>
           <table id="scoreboardTable" class="scoreboard-table">
@@ -123,6 +123,11 @@
             Historical controversy scores are evidence-gated. A page needs repeated article-text
             battles with at least two combatants before it can rank highly; raw revert volume is
             supporting context, not proof by itself.
+          </p>
+          <p>
+            Historical scoreboards are grouped by year. Monthly dump partitions remain the durable
+            backfill unit, and each completed month is folded into its year from local aggregate
+            tables when the scoreboard is queried.
           </p>
           <p>
             Battle drill-downs use targeted MediaWiki revision-content diffs. For large historical

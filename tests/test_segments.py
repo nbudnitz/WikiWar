@@ -7,6 +7,7 @@ from wikiwar.segments import (
     changed_text_segments,
     changed_text_snippets,
     diverse_segments,
+    is_graffiti_like_segment_text,
     period_bounds,
     top_contested_revision_pairs,
     top_contested_text_segments,
@@ -20,6 +21,18 @@ def test_changed_text_snippets_extracts_actual_changed_phrase() -> None:
     )
 
     assert "strongly" in snippets
+
+
+def test_changed_text_segments_filters_repeated_word_graffiti() -> None:
+    graffiti = "Dick" * 120
+
+    segments = changed_text_segments(
+        "The park opened in 2007 for soccer matches.",
+        f"The park opened in 2007 for soccer matches. {graffiti}",
+    )
+
+    assert segments == []
+    assert is_graffiti_like_segment_text(graffiti)
 
 
 def test_changed_text_segments_include_context() -> None:
@@ -322,6 +335,59 @@ def test_top_contested_revision_pairs_exposes_first_shot_comment() -> None:
     assert rows[0]["first_shot_comment"] == "Use the common Indian name Ganga in the lead."
 
 
+def test_top_contested_revision_pairs_filters_generated_first_shot_comments() -> None:
+    revision_pairs = []
+    generated = "Undid revision 239922417 by [[Special:Contributions/Example|Example]] ([[User talk:Example|talk]])"
+    for index in range(3):
+        revision_pairs.append(
+            (
+                {
+                    "rev_id": 100 + index,
+                    "content": "The river is called Ganga in the lead.",
+                    "user_text": "Alice",
+                    "comment": generated if index == 0 else "Use Ganga because Indian sources prefer that name.",
+                },
+                {
+                    "rev_id": 200 + index,
+                    "content": "The river is called Ganges in the lead.",
+                    "user_text": "Bob",
+                    "comment": "Undid revision 239922500 by [[Special:Contributions/Alice|Alice]] ([[User talk:Alice|talk]])",
+                    "tags": [],
+                },
+            )
+        )
+
+    rows = top_contested_revision_pairs(revision_pairs, limit=1)
+
+    assert rows[0]["first_shot_comment"] == "Use Ganga because Indian sources prefer that name."
+
+
+def test_top_contested_revision_pairs_hides_generated_first_shot_when_no_substantive_comment() -> None:
+    revision_pairs = []
+    for index in range(3):
+        revision_pairs.append(
+            (
+                {
+                    "rev_id": 100 + index,
+                    "content": "The river is called Ganga in the lead.",
+                    "user_text": "Alice",
+                    "comment": "Undid revision 239922417 by [[Special:Contributions/Example|Example]] ([[User talk:Example|talk]])",
+                },
+                {
+                    "rev_id": 200 + index,
+                    "content": "The river is called Ganges in the lead.",
+                    "user_text": "Bob",
+                    "comment": "revert",
+                    "tags": [],
+                },
+            )
+        )
+
+    rows = top_contested_revision_pairs(revision_pairs, limit=1)
+
+    assert rows[0]["first_shot_comment"] == ""
+
+
 def test_top_contested_text_segments_groups_comoving_revert_phrases() -> None:
     version_a = (
         "The genre was shaped by older fans. "
@@ -361,6 +427,13 @@ def test_period_bounds_uses_historical_partition_month() -> None:
 
     assert start == datetime(2007, 9, 1, tzinfo=timezone.utc)
     assert end == datetime(2007, 10, 1, tzinfo=timezone.utc)
+
+
+def test_period_bounds_uses_historical_year_period() -> None:
+    start, end = period_bounds("history-year:2026-05:2007")
+
+    assert start == datetime(2007, 1, 1, tzinfo=timezone.utc)
+    assert end == datetime(2008, 1, 1, tzinfo=timezone.utc)
 
 
 def test_diverse_segments_filters_overlapping_phrase_variants() -> None:

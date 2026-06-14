@@ -4,6 +4,9 @@ import bz2
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
 from wikiwar.historical import (
     EVENT_ENTITY,
     EVENT_TIMESTAMP,
@@ -24,9 +27,18 @@ from wikiwar.historical import (
     effective_revert_edges,
     parse_history_row,
     process_history_files,
+    probable_revert_only_cleanup_row,
     record_to_aggregate,
     score_historical_page,
 )
+from wikiwar.repository import (
+    historical_month_periods,
+    historical_periods,
+    historical_year_periods_from_months,
+    load_historical_year_aggregates,
+    replace_historical_aggregates,
+)
+from wikiwar.schema import metadata
 
 
 def test_parse_history_row_reads_revision_create() -> None:
@@ -292,6 +304,86 @@ def test_historical_aggregate_record_round_trips_for_rescoring() -> None:
     assert score_historical_page(restored) == score_historical_page(aggregate)
 
 
+def test_historical_year_periods_group_completed_month_partitions() -> None:
+    periods = historical_year_periods_from_months(
+        [
+            "history:2026-05:2014-01",
+            "history:2026-05:2014-02",
+            "history:2026-05:2015-01",
+            "not-history",
+        ]
+    )
+
+    assert periods == ["history-year:2026-05:2015", "history-year:2026-05:2014"]
+
+
+def test_historical_year_aggregate_includes_newly_completed_month() -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False, future=True)
+
+    january = aggregate_to_record(
+        historical_aggregate_with_activity(
+            page_id=42,
+            title="Example",
+            edit_count=12,
+            editor_count=4,
+            edge_counts={("Alice", "Bob"): 4, ("Bob", "Alice"): 4},
+            start=datetime(2014, 1, 1, tzinfo=timezone.utc),
+        )
+    )
+    february = aggregate_to_record(
+        historical_aggregate_with_activity(
+            page_id=42,
+            title="Example",
+            edit_count=10,
+            editor_count=4,
+            edge_counts={("Alice", "Bob"): 4, ("Bob", "Alice"): 4},
+            start=datetime(2014, 2, 1, tzinfo=timezone.utc),
+        )
+    )
+    assert january is not None
+    assert february is not None
+
+    with Session() as session:
+        replace_historical_aggregates(session, "history:2026-05:2014-01", [january])
+
+        assert historical_month_periods(session) == ["history:2026-05:2014-01"]
+        assert historical_periods(session) == ["history-year:2026-05:2014"]
+        records = load_historical_year_aggregates(session, "history-year:2026-05:2014", candidate_limit=10)
+        assert records[0]["edit_count"] == january["edit_count"]
+
+        replace_historical_aggregates(session, "history:2026-05:2014-02", [february])
+
+        records = load_historical_year_aggregates(session, "history-year:2026-05:2014", candidate_limit=10)
+        assert records[0]["edit_count"] == january["edit_count"] + february["edit_count"]
+        assert len(records[0]["buckets"]) == len(january["buckets"]) + len(february["buckets"])
+
+
+def test_probable_revert_only_cleanup_row_flags_high_density_churn() -> None:
+    row = {
+        "revert_density": 0.91,
+        "unique_editors": 10,
+        "war_minutes": 60,
+        "episode_count": 1,
+        "mutual_revert_pairs": 3,
+    }
+
+    assert probable_revert_only_cleanup_row(row)
+
+
+def test_probable_revert_only_cleanup_row_keeps_broader_disputes() -> None:
+    row = {
+        "revert_density": 0.56,
+        "unique_editors": 59,
+        "war_minutes": 360,
+        "episode_count": 5,
+        "mutual_revert_pairs": 10,
+    }
+
+    assert not probable_revert_only_cleanup_row(row)
+
+
 def history_row(
     *,
     rev_id: int,
@@ -328,9 +420,10 @@ def historical_aggregate_with_activity(
     edit_count: int,
     editor_count: int,
     edge_counts: dict[tuple[str, str], int],
+    start: datetime | None = None,
 ) -> PageHistoricalAggregate:
     aggregate = PageHistoricalAggregate(wiki="enwiki", page_id=page_id, page_title=title)
-    start = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    start = start or datetime(2020, 1, 1, tzinfo=timezone.utc)
     users = [f"Editor{index}" for index in range(editor_count)]
     for index in range(edit_count):
         revision = parse_history_row(

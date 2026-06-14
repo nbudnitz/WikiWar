@@ -9,6 +9,7 @@ WikiWar tracks live Wikipedia edit-conflict signals. This MVP implements Milesto
 - A live dashboard, scoreboard, page detail timeline, and Wikipedia links.
 
 Historical scoreboards are generated from downloadable `mediawiki_history` dumps, not Action API crawling.
+Historical battle/talk evidence is also local-first: build it from downloaded revision-content XML dumps and cache compact results in the app database. The MediaWiki API is reserved for live views, explicit spot checks, and opt-in fallback.
 
 ## Run Locally
 
@@ -98,7 +99,7 @@ Process it into a historical scoreboard period:
 python -m wikiwar.historical process data/dumps/2026-05.enwiki.2001-01.tsv.bz2 --period history:2026-05:2001-01
 ```
 
-The dashboard Scoreboard tab will show processed historical periods after refresh. For larger runs, process partitions in chronological order so revert edges can be reconstructed when a reverting revision appears in a later file.
+The dashboard Scoreboard tab groups processed historical months into year scoreboards after refresh. Month partitions remain the backfill write unit, so a newly completed `history:2026-05:2014-09` partition is picked up automatically by the `history-year:2026-05:2014` scoreboard without rewriting earlier months. For larger runs, process partitions in chronological order so revert edges can be reconstructed when a reverting revision appears in a later file.
 
 After prefetching, run the resumable local backfill:
 
@@ -117,6 +118,18 @@ nohup python -m wikiwar.historical backfill \
 ```
 
 The backfill processes local monthly partitions and skips periods that already exist in `scoreboard_snapshots`, so the same command can be rerun after interruption. If a required local file is missing, the backfill can still fetch it over HTTPS, but the preferred bulk path is `prefetch` first, parse locally second.
+
+Build local battle/talk evidence from downloaded `pages-meta-history` XML dumps after the compact scoreboard rows exist:
+
+```sh
+python -m wikiwar.evidence backfill \
+  --period history-year:2026-05:2017 \
+  --dump data/dumps/enwiki-20260501-pages-meta-history1.xml-p1p41242.bz2 \
+  --dump data/dumps/enwiki-20260501-pages-meta-history2.xml-p41243p151573.bz2 \
+  --limit 100
+```
+
+Pass every XML shard needed to cover the candidate article pages and their talk pages. The evidence backfill streams/decompresses the dump files, extracts only the selected period, writes compact `historical_evidence_cache` rows, and does not call the MediaWiki API. Historical scoreboard drill-downs use this cache by default; if no local evidence exists yet, the UI reports that the page/period has not been backfilled. Use `allow_api_fallback=true` on `/api/scoreboard/segments` only for deliberate spot checks.
 
 Monitor long historical jobs:
 

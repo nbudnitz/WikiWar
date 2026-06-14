@@ -188,12 +188,29 @@ historical_processed_periods = Table(
 )
 
 
+historical_evidence_cache = Table(
+    "historical_evidence_cache",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("period", String(64), nullable=False),
+    Column("wiki", String(64), nullable=False),
+    Column("page_id", Integer, nullable=False),
+    Column("page_title", String(1024), nullable=False),
+    Column("source", String(64), nullable=False),
+    Column("revision_count", Integer, nullable=False),
+    Column("payload_json", Text, nullable=False),
+    Column("generated_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint("period", "wiki", "page_id", name="uq_hist_evidence_period_page"),
+)
+
+
 Index("ix_edits_page_time", edits.c.wiki, edits.c.page_id, edits.c.timestamp)
 Index("ix_page_windows_latest", page_windows.c.wiki, page_windows.c.window_size, page_windows.c.id)
 Index("ix_war_episodes_active", war_episodes.c.wiki, war_episodes.c.status, war_episodes.c.peak_score)
 Index("ix_hist_page_period", historical_page_aggregates.c.period, historical_page_aggregates.c.wiki, historical_page_aggregates.c.page_id)
 Index("ix_hist_bucket_period_page", historical_hourly_buckets.c.period, historical_hourly_buckets.c.wiki, historical_hourly_buckets.c.page_id, historical_hourly_buckets.c.bucket_start)
 Index("ix_hist_processed_period", historical_processed_periods.c.period)
+Index("ix_hist_evidence_period_page", historical_evidence_cache.c.period, historical_evidence_cache.c.wiki, historical_evidence_cache.c.page_id)
 
 
 def utcnow() -> datetime:

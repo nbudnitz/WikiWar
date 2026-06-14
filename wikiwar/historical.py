@@ -24,6 +24,7 @@ from .repository import (
     historical_aggregate_period_exists,
     historical_aggregate_periods,
     historical_processed_period_exists,
+    load_historical_year_aggregates,
     load_historical_aggregates,
     mark_historical_period_processed,
     replace_historical_aggregates,
@@ -541,6 +542,49 @@ def recompute_scoreboard_from_aggregates(
             replace_scoreboard_snapshot(session, selected_period, selected)
             rewritten.append(selected_period)
     return rewritten
+
+
+def historical_year_scoreboard(
+    session,
+    *,
+    period: str,
+    limit: int = 100,
+    min_score: float = 40.0,
+) -> list[dict[str, object]]:
+    candidate_limit = max(limit * 4, 100)
+    aggregates = [
+        record_to_aggregate(record)
+        for record in load_historical_year_aggregates(session, period, candidate_limit)
+    ]
+    scored_rows = [
+        row
+        for row in (score_historical_page(aggregate) for aggregate in aggregates)
+        if row["peak_score"] >= min_score
+        and not probable_revert_only_cleanup_row(row)
+    ]
+    selected = rank_historical_rows(scored_rows, limit)
+    for rank, row in enumerate(selected, start=1):
+        row["id"] = None
+        row["period"] = period
+        row["rank"] = rank
+    return selected
+
+
+def probable_revert_only_cleanup_row(row: dict[str, object]) -> bool:
+    revert_density = float(row.get("revert_density") or 0.0)
+    unique_editors = int(row.get("unique_editors") or 0)
+    war_minutes = int(row.get("war_minutes") or 0)
+    episode_count = int(row.get("episode_count") or 0)
+    mutual_pairs = int(row.get("mutual_revert_pairs") or 0)
+    short_cleanup_burst = (
+        revert_density >= 0.82
+        and unique_editors <= 16
+        and war_minutes <= HISTORICAL_BUCKET_MINUTES * 2
+        and episode_count <= 1
+        and mutual_pairs <= 8
+    )
+    revert_only_churn = revert_density >= 0.82 and unique_editors <= 40 and mutual_pairs <= 8
+    return short_cleanup_burst or revert_only_churn
 
 
 def rank_historical_rows(rows: list[dict[str, object]], limit: int) -> list[dict[str, object]]:

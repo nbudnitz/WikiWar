@@ -12,14 +12,19 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import settings
-from .controversy import enrich_segments_payload, rerank_historical_rows
+from .controversy import enrich_segments_payload
+from .historical import historical_year_scoreboard
 from .ingest import run_eventstream_ingest
 from .repository import (
     active_episodes,
+    apply_cached_historical_evidence,
     episode_scoreboard,
+    historical_month_periods,
     historical_periods,
     historical_scoreboard,
+    is_historical_year_period,
     latest_window_candidates,
+    load_historical_evidence,
     recent_edits_for_page,
     recent_windows_for_page,
 )
@@ -97,7 +102,8 @@ def scoreboard(
 def historical_snapshot_periods() -> dict[str, Any]:
     with SessionLocal() as session:
         periods = historical_periods(session)
-    return {"periods": periods}
+        monthly_periods = historical_month_periods(session)
+    return {"periods": periods, "monthly_periods": monthly_periods}
 
 
 @app.get("/api/historical/scoreboard")
@@ -107,9 +113,18 @@ def historical_snapshot_scoreboard(
 ) -> dict[str, Any]:
     candidate_limit = min(200, max(limit * 3, 30))
     with SessionLocal() as session:
-        rows = historical_scoreboard(session, period, candidate_limit)
-    selected_period = rows[0]["period"] if rows else period
-    rows = rerank_historical_rows(rows, limit=limit) if rows else []
+        selected_period = period
+        if selected_period is None:
+            available_periods = historical_periods(session)
+            selected_period = available_periods[0] if available_periods else None
+        selected_period_is_year = is_historical_year_period(selected_period)
+        if selected_period_is_year:
+            rows = historical_year_scoreboard(session, period=selected_period or "", limit=candidate_limit)
+        else:
+            rows = historical_scoreboard(session, selected_period, candidate_limit)
+        rows = apply_cached_historical_evidence(session, rows)
+    selected_period = rows[0]["period"] if rows else selected_period
+    rows = rows[:limit]
     return {"period": selected_period, "rows": serialize(rows)}
 
 
@@ -120,8 +135,26 @@ def scoreboard_segments(
     page_title: str = "",
     period: str | None = None,
     historical: bool = False,
+    allow_api_fallback: bool = False,
 ) -> dict[str, Any]:
     try:
+        if historical and period:
+            with SessionLocal() as session:
+                cached = load_historical_evidence(
+                    session,
+                    period=period,
+                    wiki=wiki,
+                    page_id=page_id,
+                )
+            if cached:
+                return serialize(cached["payload"])
+            if not allow_api_fallback:
+                return {
+                    "source": "local_evidence_missing",
+                    "revision_count": 0,
+                    "segments": [],
+                    "message": "Local historical evidence has not been backfilled for this page and period yet.",
+                }
         payload = fetch_revision_segments(
             wiki=wiki,
             page_id=page_id,

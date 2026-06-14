@@ -70,3 +70,28 @@ def test_controversy_score_penalizes_cleanup_without_talk() -> None:
     assert score["cleanup_penalty"] > 0
     assert score["score"] < score["battle_score"]
     assert score["score"] <= 25
+
+
+def test_controversy_score_caps_single_battle_without_talk_evidence() -> None:
+    segments = [
+        {
+            "change_type": "addition",
+            "score": 500,
+            "reverts": 40,
+            "changes": 40,
+            "combatants": 2,
+            "cleanup_comment_count": 0,
+            "comment_count": 10,
+        }
+    ]
+
+    score = score_controversy_evidence(
+        peak_score=800,
+        revert_count=200,
+        mutual_revert_pairs=2,
+        segments=segments,
+        talk={"score": 0, "evidence": []},
+    )
+
+    assert score["battle_score"] == 500
+    assert score["score"] < 150

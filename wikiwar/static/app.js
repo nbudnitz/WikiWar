@@ -204,11 +204,12 @@ async function loadScoreboard() {
   const value = document.getElementById("scoreboardPeriod").value;
   const isHistorical = value.startsWith("historical:");
   const selectedPeriod = isHistorical ? value.replace("historical:", "") : "";
+  const rows = document.getElementById("scoreboardRows");
+  rows.innerHTML = `<tr><td colspan="${scoreboardColumnCount(isHistorical)}">Loading scoreboard...</td></tr>`;
   const response = isHistorical
     ? await fetch(`/api/historical/scoreboard?period=${encodeURIComponent(selectedPeriod)}&limit=20`)
     : await fetch(`/api/scoreboard?hours=${value.replace("live:", "")}`);
   const payload = await response.json();
-  const rows = document.getElementById("scoreboardRows");
   document.getElementById("scoreboardTable").classList.toggle("is-historical", isHistorical);
   document.getElementById("scoreboardScoreHeader").textContent = isHistorical ? "Controversy" : "Conflict Score";
   document.getElementById("scoreboardMetricA").textContent = isHistorical ? "Evidence" : "Reverts";
@@ -247,6 +248,11 @@ function formatLength(minutes) {
 }
 
 function formatEvidence(row) {
+  if (row.battle_count == null && row.talk_evidence_count == null) {
+    const pairs = Number(row.mutual_revert_pairs || 0);
+    const reverts = Number(row.revert_count || 0);
+    return `${fmt.format(pairs)} pair${pairs === 1 ? "" : "s"}, ${fmt.format(reverts)} reverts`;
+  }
   const battles = Number(row.battle_count || 0);
   const talk = Number(row.talk_evidence_count || 0);
   return `${fmt.format(battles)} battle${battles === 1 ? "" : "s"}, ${fmt.format(talk)} talk`;
@@ -302,6 +308,12 @@ async function toggleScoreboardSegments(rowElement, row, isHistorical, selectedP
 function renderScoreboardSegments(payload) {
   const segments = payload.segments || [];
   const evidenceHtml = controversyEvidenceHtml(payload.controversy);
+  if (payload.source === "local_evidence_missing") {
+    return `
+      <h3>Battles</h3>
+      <p class="muted">${escapeHtml(payload.message || "Local historical battle evidence has not been backfilled for this page and period yet.")}</p>
+    `;
+  }
   if (!segments.length) {
     return `
       <h3>Battles</h3>
@@ -341,11 +353,11 @@ function segmentLineHtml(segment, options = {}) {
       </p>
       <div class="segment-under">
         ${showMetrics ? `
+          ${firstShotHtml(segment)}
           <span class="segment-metrics" aria-label="Segment metrics">
             <span class="is-battle-counts">${segment.reverts} reverts, ${segment.changes ?? segment.edits} changes</span>
             <span>${segment.combatants ?? segment.editors} combatants</span>
           </span>
-          ${firstShotHtml(segment)}
         ` : ""}
       </div>
     </div>
@@ -366,7 +378,7 @@ function controversyEvidenceHtml(controversy) {
       ${talk.length ? `
         <div class="talk-evidence">
           ${talk.slice(0, 3).map((item) => `
-            <p><span>Talk</span>${escapeHtml(item.sentence || item.comment || "Talk page dispute signal")}</p>
+            <p><span>Talk</span> ${escapeHtml(item.sentence || item.comment || "Talk page dispute signal")}</p>
           `).join("")}
         </div>
       ` : `<p class="muted">No talk-page debate matched these battle terms in this period.</p>`}
@@ -377,7 +389,7 @@ function controversyEvidenceHtml(controversy) {
 function firstShotHtml(segment) {
   const comment = String(segment.first_shot_comment || "").trim();
   if (!comment) return "";
-  return `<p class="segment-first-shot"><span>First shot</span>${escapeHtml(comment)}</p>`;
+  return `<p class="segment-first-shot"><span>First shot</span> ${escapeHtml(comment)}</p>`;
 }
 
 function segmentHasSwapValues(segment) {
@@ -489,13 +501,36 @@ async function loadHistoricalPeriods() {
   const response = await fetch("/api/historical/periods");
   const payload = await response.json();
   const group = document.getElementById("historicalPeriods");
+  const monthCounts = historicalYearMonthCounts(payload.monthly_periods || []);
   group.innerHTML = "";
   for (const period of payload.periods || []) {
     const option = document.createElement("option");
     option.value = `historical:${period}`;
-    option.textContent = period;
+    option.textContent = formatHistoricalPeriod(period, monthCounts.get(period));
     group.appendChild(option);
   }
+}
+
+function historicalYearMonthCounts(monthlyPeriods) {
+  const counts = new Map();
+  for (const period of monthlyPeriods) {
+    const match = String(period || "").match(/^history:(\d{4}-\d{2}):(\d{4})-\d{2}$/);
+    if (!match) continue;
+    const yearPeriod = `history-year:${match[1]}:${match[2]}`;
+    counts.set(yearPeriod, (counts.get(yearPeriod) || 0) + 1);
+  }
+  return counts;
+}
+
+function formatHistoricalPeriod(period, monthCount) {
+  const yearMatch = String(period || "").match(/^history-year:(\d{4}-\d{2}):(\d{4})$/);
+  if (yearMatch) {
+    const countLabel = Number(monthCount || 0) > 0 ? `, ${monthCount}/12 months` : "";
+    return `${yearMatch[2]} (${yearMatch[1]} snapshot${countLabel})`;
+  }
+  const monthMatch = String(period || "").match(/^history:(\d{4}-\d{2}):(\d{4}-\d{2})$/);
+  if (monthMatch) return `${monthMatch[2]} (${monthMatch[1]} snapshot)`;
+  return String(period || "");
 }
 
 function stat(labelText, value) {

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import re
 from typing import Any
 
-from sqlalchemy import delete, desc, func, insert, select, update
+from sqlalchemy import delete, desc, func, insert, select, tuple_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -11,6 +12,7 @@ from .domain import EditEvent, RevertSignal, WindowScore
 from .schema import (
     dumps,
     edits,
+    historical_evidence_cache,
     historical_hourly_buckets,
     historical_page_aggregates,
     historical_processed_periods,
@@ -21,6 +23,10 @@ from .schema import (
     scoreboard_snapshots,
     war_episodes,
 )
+
+
+HISTORICAL_MONTH_RE = re.compile(r"^history:(?P<snapshot>\d{4}-\d{2}):(?P<month>\d{4}-\d{2})$")
+HISTORICAL_YEAR_RE = re.compile(r"^history-year:(?P<snapshot>\d{4}-\d{2}):(?P<year>\d{4})$")
 
 
 def save_raw_event(session: Session, stream_id: str | None, received_at: datetime, payload: dict[str, Any]) -> bool:
@@ -382,6 +388,117 @@ def historical_aggregate_periods(session: Session) -> list[str]:
     return [row[0] for row in rows]
 
 
+def historical_month_periods(session: Session) -> list[str]:
+    aggregate_periods = set(historical_aggregate_periods(session))
+    snapshot_rows = session.execute(
+        select(scoreboard_snapshots.c.period).distinct()
+    )
+    snapshot_periods = {row[0] for row in snapshot_rows}
+    periods = [
+        period
+        for period in aggregate_periods | snapshot_periods
+        if HISTORICAL_MONTH_RE.match(period)
+    ]
+    return sorted(periods, reverse=True)
+
+
+def historical_year_periods_from_months(month_periods: list[str]) -> list[str]:
+    years: set[str] = set()
+    for period in month_periods:
+        match = HISTORICAL_MONTH_RE.match(period)
+        if not match:
+            continue
+        years.add(f"history-year:{match.group('snapshot')}:{match.group('month')[:4]}")
+    return sorted(years, reverse=True)
+
+
+def historical_month_periods_for_year(month_periods: list[str], year_period: str) -> list[str]:
+    year_match = HISTORICAL_YEAR_RE.match(year_period)
+    if not year_match:
+        return []
+    snapshot = year_match.group("snapshot")
+    year = year_match.group("year")
+    return [
+        period
+        for period in sorted(month_periods)
+        if period.startswith(f"history:{snapshot}:{year}-")
+    ]
+
+
+def is_historical_year_period(period: str | None) -> bool:
+    return bool(period and HISTORICAL_YEAR_RE.match(period))
+
+
+def load_historical_year_aggregates(
+    session: Session,
+    year_period: str,
+    candidate_limit: int = 200,
+) -> list[dict[str, Any]]:
+    month_periods = historical_month_periods_for_year(historical_month_periods(session), year_period)
+    if not month_periods:
+        return []
+
+    edit_sum = func.sum(historical_page_aggregates.c.edit_count).label("edit_count")
+    revert_sum = func.sum(historical_page_aggregates.c.revert_count).label("revert_count")
+    mutual_sum = func.sum(historical_page_aggregates.c.mutual_revert_pairs).label("mutual_revert_pairs")
+    candidate_rows = session.execute(
+        select(
+            historical_page_aggregates.c.wiki,
+            historical_page_aggregates.c.page_id,
+            func.max(historical_page_aggregates.c.page_title).label("page_title"),
+            edit_sum,
+            revert_sum,
+            mutual_sum,
+            func.min(historical_page_aggregates.c.first_timestamp).label("first_timestamp"),
+            func.max(historical_page_aggregates.c.last_timestamp).label("last_timestamp"),
+        )
+        .where(historical_page_aggregates.c.period.in_(month_periods))
+        .group_by(historical_page_aggregates.c.wiki, historical_page_aggregates.c.page_id)
+        .order_by(desc(mutual_sum), desc(revert_sum), desc(edit_sum))
+        .limit(candidate_limit)
+    ).mappings()
+    candidates = [dict(row) for row in candidate_rows]
+    if not candidates:
+        return []
+
+    candidate_keys = [(row["wiki"], row["page_id"]) for row in candidates]
+    bucket_rows = session.execute(
+        select(historical_hourly_buckets)
+        .where(historical_hourly_buckets.c.period.in_(month_periods))
+        .where(tuple_(historical_hourly_buckets.c.wiki, historical_hourly_buckets.c.page_id).in_(candidate_keys))
+        .order_by(
+            historical_hourly_buckets.c.wiki,
+            historical_hourly_buckets.c.page_id,
+            historical_hourly_buckets.c.bucket_start,
+        )
+    ).mappings()
+
+    buckets_by_page: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    editors_by_page: dict[tuple[str, int], set[str]] = {}
+    for bucket in bucket_rows:
+        key = (bucket["wiki"], bucket["page_id"])
+        editors = loads(bucket["editors_json"]) or {}
+        buckets_by_page.setdefault(key, []).append(
+            {
+                "bucket_start": bucket["bucket_start"],
+                "edit_count": bucket["edit_count"],
+                "editors": editors,
+                "revert_edges": loads(bucket["revert_edges_json"]) or [],
+            }
+        )
+        editors_by_page.setdefault(key, set()).update(
+            str(editor) for editor, count in editors.items() if int(count) > 0
+        )
+
+    result: list[dict[str, Any]] = []
+    for candidate in candidates:
+        key = (candidate["wiki"], candidate["page_id"])
+        candidate["unique_editors"] = len(editors_by_page.get(key, set()))
+        candidate["buckets"] = buckets_by_page.get(key, [])
+        result.append(candidate)
+    return result
+
+
 def load_historical_aggregates(session: Session, period: str) -> list[dict[str, Any]]:
     bucket_rows = session.execute(
         select(historical_hourly_buckets)
@@ -418,10 +535,9 @@ def load_historical_aggregates(session: Session, period: str) -> list[dict[str, 
 
 
 def historical_periods(session: Session) -> list[str]:
-    rows = session.execute(
-        select(scoreboard_snapshots.c.period).distinct().order_by(desc(scoreboard_snapshots.c.period))
-    )
-    return [row[0] for row in rows]
+    month_periods = historical_month_periods(session)
+    year_periods = historical_year_periods_from_months(month_periods)
+    return year_periods or month_periods
 
 
 def historical_scoreboard(
@@ -447,6 +563,104 @@ def historical_scoreboard(
         .limit(limit)
     ).mappings()
     return [dict(row) for row in rows]
+
+
+def save_historical_evidence(
+    session: Session,
+    *,
+    period: str,
+    wiki: str,
+    page_id: int,
+    page_title: str,
+    source: str,
+    payload: dict[str, Any],
+) -> None:
+    session.execute(
+        delete(historical_evidence_cache).where(
+            historical_evidence_cache.c.period == period,
+            historical_evidence_cache.c.wiki == wiki,
+            historical_evidence_cache.c.page_id == page_id,
+        )
+    )
+    session.execute(
+        insert(historical_evidence_cache).values(
+            period=period,
+            wiki=wiki,
+            page_id=page_id,
+            page_title=page_title,
+            source=source,
+            revision_count=int(payload.get("revision_count") or 0),
+            payload_json=dumps(payload),
+            generated_at=datetime.now(timezone.utc),
+        )
+    )
+    session.commit()
+
+
+def load_historical_evidence(
+    session: Session,
+    *,
+    period: str,
+    wiki: str,
+    page_id: int,
+) -> dict[str, Any] | None:
+    row = session.execute(
+        select(historical_evidence_cache)
+        .where(
+            historical_evidence_cache.c.period == period,
+            historical_evidence_cache.c.wiki == wiki,
+            historical_evidence_cache.c.page_id == page_id,
+        )
+        .limit(1)
+    ).mappings().first()
+    if row is None:
+        return None
+    item = dict(row)
+    payload = loads(item.pop("payload_json", "{}")) or {}
+    item["payload"] = payload
+    return item
+
+
+def apply_cached_historical_evidence(
+    session: Session,
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not rows:
+        return rows
+    keys = [
+        (str(row.get("period") or ""), str(row.get("wiki") or ""), int(row.get("page_id") or 0))
+        for row in rows
+        if row.get("period") and row.get("wiki") and row.get("page_id")
+    ]
+    if not keys:
+        return rows
+    evidence_rows = session.execute(
+        select(historical_evidence_cache).where(
+            tuple_(
+                historical_evidence_cache.c.period,
+                historical_evidence_cache.c.wiki,
+                historical_evidence_cache.c.page_id,
+            ).in_(keys)
+        )
+    ).mappings()
+    evidence_by_key: dict[tuple[str, str, int], dict[str, Any]] = {}
+    for evidence in evidence_rows:
+        payload = loads(evidence["payload_json"]) or {}
+        evidence_by_key[(evidence["period"], evidence["wiki"], evidence["page_id"])] = payload
+
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        key = (str(item.get("period") or ""), str(item.get("wiki") or ""), int(item.get("page_id") or 0))
+        payload = evidence_by_key.get(key)
+        if payload:
+            controversy = payload.get("controversy") or {}
+            item["controversy_score"] = round(float(controversy.get("score") or 0.0), 2)
+            item["battle_count"] = int(controversy.get("battle_count") or len(payload.get("segments") or []))
+            item["talk_evidence_count"] = int(controversy.get("talk_evidence_count") or 0)
+            item["local_evidence_source"] = payload.get("source") or "local_cache"
+        result.append(item)
+    return result
 
 
 def historical_period_exists(session: Session, period: str) -> bool:

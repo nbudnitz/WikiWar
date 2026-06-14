@@ -16,8 +16,10 @@ from .segments import (
     clean_wikitext,
     fetch_revision_segments,
     first_sentence,
+    is_graffiti_like_segment_text,
     normalize_candidate,
     period_bounds,
+    top_contested_text_segments,
 )
 
 
@@ -32,39 +34,27 @@ SOURCE_DEBATE_RE = re.compile(
 )
 MAX_RERANK_CANDIDATES = 40
 RERANK_WORKERS = 6
+RERANK_BATCH_SIZE = 12
 TALK_REVISION_LIMIT = 35
 
 
-def rerank_historical_rows(rows: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+def rerank_historical_rows(
+    rows: list[dict[str, Any]],
+    *,
+    limit: int,
+    max_candidates: int = MAX_RERANK_CANDIDATES,
+) -> list[dict[str, Any]]:
     if not rows:
         return []
-    candidates = rows[: min(len(rows), MAX_RERANK_CANDIDATES)]
     enriched: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=min(RERANK_WORKERS, len(candidates))) as executor:
-        futures = {
-            executor.submit(
-                controversy_enrichment_for_page,
-                str(row.get("wiki") or settings.wiki_db),
-                int(row["page_id"]),
-                str(row.get("page_title") or ""),
-                str(row.get("period") or ""),
-                float(row.get("peak_score") or 0.0),
-                int(row.get("revert_count") or 0),
-                int(row.get("mutual_revert_pairs") or 0),
-            ): row
-            for row in candidates
-        }
-        for future in as_completed(futures):
-            row = dict(futures[future])
-            try:
-                evidence = future.result()
-            except Exception as exc:  # pragma: no cover - API failures should degrade.
-                evidence = unavailable_evidence(str(exc))
-            row.update(scoreboard_fields_from_evidence(evidence))
-            row["controversy"] = evidence
-            enriched.append(row)
+    candidates = rows[: min(len(rows), max_candidates)]
+    for start in range(0, len(candidates), RERANK_BATCH_SIZE):
+        batch = candidates[start : start + RERANK_BATCH_SIZE]
+        enriched.extend(enrich_historical_rows(batch))
+        if len(positive_controversy_rows(enriched)) >= limit:
+            break
 
-    ranked = [row for row in enriched if float(row.get("controversy_score") or 0.0) > 0.0]
+    ranked = positive_controversy_rows(enriched)
     ranked.sort(
         key=lambda row: (
             float(row.get("controversy_score") or 0.0),
@@ -77,6 +67,40 @@ def rerank_historical_rows(rows: list[dict[str, Any]], *, limit: int) -> list[di
     for index, row in enumerate(ranked[:limit], start=1):
         row["rank"] = index
     return ranked[:limit]
+
+
+def enrich_historical_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    enriched: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=min(RERANK_WORKERS, len(rows))) as executor:
+        futures = {
+            executor.submit(
+                controversy_enrichment_for_page,
+                str(row.get("wiki") or settings.wiki_db),
+                int(row["page_id"]),
+                str(row.get("page_title") or ""),
+                str(row.get("period") or ""),
+                float(row.get("peak_score") or 0.0),
+                int(row.get("revert_count") or 0),
+                int(row.get("mutual_revert_pairs") or 0),
+            ): row
+            for row in rows
+        }
+        for future in as_completed(futures):
+            row = dict(futures[future])
+            try:
+                evidence = future.result()
+            except Exception as exc:  # pragma: no cover - API failures should degrade.
+                evidence = unavailable_evidence(str(exc))
+            row.update(scoreboard_fields_from_evidence(evidence))
+            row["controversy"] = evidence
+            enriched.append(row)
+    return enriched
+
+
+def positive_controversy_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [row for row in rows if float(row.get("controversy_score") or 0.0) > 0.0]
 
 
 @lru_cache(maxsize=512)
@@ -168,6 +192,56 @@ def enrich_segments_payload(
     }
 
 
+def build_local_evidence_payload(
+    *,
+    article_revisions: list[dict[str, Any]],
+    talk_revisions: list[dict[str, Any]],
+    wiki: str,
+    page_id: int,
+    page_title: str,
+    period: str,
+    peak_score: float = 0.0,
+    revert_count: int = 0,
+    mutual_revert_pairs: int = 0,
+    source: str = "local_revision_dump",
+) -> dict[str, Any]:
+    article_revisions = sorted(
+        article_revisions,
+        key=lambda revision: (str(revision.get("timestamp") or ""), int(revision.get("rev_id") or 0)),
+    )
+    segment_rows = top_contested_text_segments(article_revisions)
+    segments = usable_battles(segment_rows)
+    terms = controversy_terms(segments)
+    talk = talk_page_evidence_from_revisions(talk_revisions, terms=tuple(terms))
+    score = score_controversy_evidence(
+        peak_score=peak_score,
+        revert_count=revert_count,
+        mutual_revert_pairs=mutual_revert_pairs,
+        segments=segments,
+        talk=talk,
+    )
+    return {
+        "source": source,
+        "wiki": wiki,
+        "page_id": page_id,
+        "page_title": page_title,
+        "period": period,
+        "revision_count": len(article_revisions),
+        "segments": segments,
+        "controversy": {
+            "score": score["score"],
+            "battle_score": score["battle_score"],
+            "talk_score": score["talk_score"],
+            "metadata_score": score["metadata_score"],
+            "cleanup_penalty": score["cleanup_penalty"],
+            "battle_count": len(segments),
+            "talk_evidence_count": len(talk["evidence"]),
+            "talk_evidence": talk["evidence"],
+            "status": "ok",
+        },
+    }
+
+
 def scoreboard_fields_from_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
     return {
         "controversy_score": round(float(evidence.get("score") or 0.0), 2),
@@ -198,6 +272,8 @@ def unavailable_evidence(message: str) -> dict[str, Any]:
 def usable_battles(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result = []
     for segment in segments:
+        if is_graffiti_like_segment_text(str(segment.get("changed_text") or segment.get("segment") or "")):
+            continue
         combatants = int(segment.get("combatants") or segment.get("editors") or 0)
         reverts = int(segment.get("reverts") or 0)
         changes = int(segment.get("changes") or segment.get("edits") or 0)
@@ -243,6 +319,8 @@ def score_controversy_evidence(
     score = ((battle_score - cleanup_penalty) * talk_multiplier) + (talk_score * 2.2) + metadata_score
     if cleanup_share >= 0.7 and talk_score < 20:
         score = min(score, 25.0)
+    if len(segments) == 1 and talk_score < 20:
+        score = min(score, max(0.0, (battle_score * 0.18) + metadata_score))
     return {
         "score": round(max(0.0, score), 2),
         "battle_score": round(battle_score, 2),
@@ -328,7 +406,7 @@ def fetch_talk_page_evidence(
     for revision in revisions:
         comment = clean_comment(str(revision.get("comment") or ""))
         content = revision_content_text(revision)
-        sentences = talk_added_sentences(previous_content, content) if previous_content else []
+        sentences = talk_added_sentences(previous_content, content)
         if not sentences and comment:
             sentences = [first_sentence(comment)]
         previous_content = content
@@ -351,6 +429,54 @@ def fetch_talk_page_evidence(
                 {
                     "timestamp": revision.get("timestamp") or "",
                     "user": revision.get("user") or "",
+                    "comment": comment,
+                    "sentence": sentence,
+                    "matched_terms": term_matches[:5],
+                    "dispute": dispute,
+                }
+            )
+            break
+        if len(evidence) >= 5:
+            break
+    if not evidence and previous_content:
+        evidence.extend(snapshot_talk_evidence(previous_content, terms))
+    return {"score": talk_score(evidence), "evidence": evidence}
+
+
+def talk_page_evidence_from_revisions(
+    revisions: list[dict[str, Any]],
+    *,
+    terms: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    evidence: list[dict[str, Any]] = []
+    seen_sentences: set[str] = set()
+    previous_content = ""
+    for revision in sorted(revisions, key=lambda item: (str(item.get("timestamp") or ""), int(item.get("rev_id") or 0))):
+        comment = clean_comment(str(revision.get("comment") or ""))
+        content = clean_wikitext(str(revision.get("content") or ""))
+        sentences = talk_added_sentences(previous_content, content)
+        if not sentences and comment:
+            sentences = [first_sentence(comment)]
+        previous_content = content
+
+        for sentence in sentences:
+            if not sentence:
+                continue
+            haystack = normalize_candidate(" ".join([comment, sentence]))
+            term_matches = [term for term in terms if term and term in haystack]
+            dispute = bool(STRONG_DEBATE_RE.search(haystack)) or (
+                bool(SOURCE_DEBATE_RE.search(haystack)) and bool(term_matches)
+            )
+            if not dispute:
+                continue
+            sentence_key = normalize_candidate(sentence or comment)
+            if sentence_key in seen_sentences:
+                continue
+            seen_sentences.add(sentence_key)
+            evidence.append(
+                {
+                    "timestamp": revision.get("timestamp") or "",
+                    "user": revision.get("user_text") or revision.get("user") or "",
                     "comment": comment,
                     "sentence": sentence,
                     "matched_terms": term_matches[:5],
