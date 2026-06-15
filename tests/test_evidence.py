@@ -10,6 +10,7 @@ from wikiwar.controversy import build_local_evidence_payload
 from wikiwar.evidence import CandidateEvidenceInput, collect_revisions_from_xml_dumps
 from wikiwar.evidence import (
     RevisionDumpShard,
+    candidate_talk_page_ids,
     read_evidence_status,
     revision_shards_for_page_ids,
     talk_page_ids_from_history_dumps,
@@ -71,6 +72,26 @@ def test_talk_page_ids_from_local_history_dumps(tmp_path: Path) -> None:
     assert result == {42: 43}
 
 
+def test_candidate_talk_page_ids_uses_existing_candidate_metadata() -> None:
+    candidates = [
+        CandidateEvidenceInput(
+            wiki="enwiki",
+            page_id=42,
+            page_title="Example",
+            period="history:2026-05:2017-01",
+            talk_page_id=43,
+        ),
+        CandidateEvidenceInput(
+            wiki="enwiki",
+            page_id=44,
+            page_title="No Talk",
+            period="history:2026-05:2017-01",
+        ),
+    ]
+
+    assert candidate_talk_page_ids(candidates) == {42: 43}
+
+
 def test_evidence_status_round_trips(tmp_path: Path) -> None:
     status_file = tmp_path / "status.json"
 
@@ -103,6 +124,37 @@ def test_collects_article_and_talk_revisions_from_local_xml_dump(tmp_path: Path)
     assert len(collected.talks[42]) == 1
     assert collected.articles[42][0]["content"] == "The article called him a leader of the party."
     assert collected.talks[42][0]["content"].startswith("Editors should discuss")
+
+
+def test_collects_revisions_reuses_shard_checkpoint(tmp_path: Path) -> None:
+    dump_path = sample_revision_dump(tmp_path)
+    checkpoint_dir = tmp_path / "checkpoints"
+    candidates = [
+        CandidateEvidenceInput(
+            wiki="enwiki",
+            page_id=42,
+            page_title="Example",
+            period="history:2026-05:2017-01",
+        )
+    ]
+
+    first = collect_revisions_from_xml_dumps(
+        [dump_path],
+        candidates,
+        "history:2026-05:2017-01",
+        checkpoint_dir=checkpoint_dir,
+    )
+    dump_path.write_text("not xml", encoding="utf-8")
+    second = collect_revisions_from_xml_dumps(
+        [dump_path],
+        candidates,
+        "history:2026-05:2017-01",
+        checkpoint_dir=checkpoint_dir,
+    )
+
+    assert len(first.articles[42]) == 7
+    assert len(second.articles[42]) == 7
+    assert len(second.talks[42]) == 1
 
 
 def test_local_evidence_payload_uses_dump_content_and_talk_debate(tmp_path: Path) -> None:
@@ -211,6 +263,17 @@ def test_historical_segments_do_not_call_api_without_explicit_fallback(monkeypat
 
     monkeypatch.setattr(wikiwar_app, "SessionLocal", Session)
     monkeypatch.setattr(wikiwar_app, "fetch_revision_segments", fail_fetch_revision_segments)
+    monkeypatch.setattr(
+        wikiwar_app,
+        "read_evidence_status",
+        lambda: {
+            "status": "running",
+            "phase": "parsing_shards",
+            "current_period": "history:2026-05:2017-01",
+            "parse_shards_done": 3,
+            "parse_shards_total": 26,
+        },
+    )
 
     payload = wikiwar_app.scoreboard_segments(
         wiki="enwiki",
@@ -222,12 +285,26 @@ def test_historical_segments_do_not_call_api_without_explicit_fallback(monkeypat
 
     assert payload["source"] == "local_evidence_missing"
     assert payload["segments"] == []
+    assert payload["evidence_status"]["phase"] == "parsing_shards"
+    assert "still being backfilled" in payload["message"]
 
 
 def sample_revision_dump(tmp_path: Path) -> Path:
     path = tmp_path / "sample-pages-meta-history.xml"
     path.write_text(
         """<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/">
+  <page>
+    <title>Noise</title>
+    <ns>0</ns>
+    <id>999</id>
+    <revision>
+      <id>not-parsed-for-non-candidates</id>
+      <timestamp>2017-01-01T00:00:00Z</timestamp>
+      <contributor><username>Noise</username><id>1</id></contributor>
+      <comment>irrelevant</comment>
+      <text xml:space="preserve">This page should be skipped before revision parsing.</text>
+    </revision>
+  </page>
   <page>
     <title>Example</title>
     <ns>0</ns>

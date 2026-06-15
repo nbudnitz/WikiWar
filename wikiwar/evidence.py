@@ -9,8 +9,9 @@ from html.parser import HTMLParser
 import json
 from pathlib import Path
 import re
+import shutil
 import time
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from xml.etree import ElementTree
 
 import httpx
@@ -41,6 +42,7 @@ from .segments import period_bounds
 
 REVISION_DUMPS_BASE_URL = "https://dumps.wikimedia.org"
 DEFAULT_EVIDENCE_DUMP_DIR = Path("data/evidence-dumps")
+DEFAULT_EVIDENCE_CHECKPOINT_DIR = Path("data/evidence-checkpoints")
 DEFAULT_EVIDENCE_STATUS_FILE = Path("data/logs/evidence-backfill-status.json")
 HISTORICAL_MONTH_RE = re.compile(r"^history:(?P<snapshot>\d{4}-\d{2}):(?P<month>\d{4}-\d{2})$")
 HISTORICAL_YEAR_RE = re.compile(r"^history-year:(?P<snapshot>\d{4}-\d{2}):(?P<year>\d{4})$")
@@ -55,6 +57,7 @@ class CandidateEvidenceInput:
     peak_score: float = 0.0
     revert_count: int = 0
     mutual_revert_pairs: int = 0
+    talk_page_id: int | None = None
 
 
 @dataclass
@@ -122,6 +125,7 @@ def evidence_inputs_from_rows(rows: list[dict[str, Any]], period: str, wiki: str
                 peak_score=float(row.get("peak_score") or 0.0),
                 revert_count=int(row.get("revert_count") or 0),
                 mutual_revert_pairs=int(row.get("mutual_revert_pairs") or 0),
+                talk_page_id=int(row["talk_page_id"]) if row.get("talk_page_id") else None,
             )
         )
     return result
@@ -135,6 +139,7 @@ def backfill_local_evidence(
     limit: int = 100,
     status_file: Path | None = None,
     status: dict[str, Any] | None = None,
+    checkpoint_dir: Path | None = None,
 ) -> EvidenceBackfillResult:
     candidates = evidence_inputs_from_rows(candidate_rows_for_period(period, limit), period, wiki)
     collected = collect_revisions_from_xml_dumps(
@@ -143,6 +148,7 @@ def backfill_local_evidence(
         period,
         status_file=status_file,
         status=status,
+        checkpoint_dir=checkpoint_dir,
     )
     pages_written = 0
     init_db()
@@ -196,11 +202,14 @@ def auto_backfill_local_evidence(
     wiki: str = settings.wiki_db,
     limit: int = 20,
     output_dir: Path = DEFAULT_EVIDENCE_DUMP_DIR,
+    checkpoint_dir: Path = DEFAULT_EVIDENCE_CHECKPOINT_DIR,
     history_dump_dir: Path = Path("data/dumps"),
     status_file: Path = DEFAULT_EVIDENCE_STATUS_FILE,
     include_talk: bool = False,
+    reset_checkpoints: bool = False,
 ) -> list[EvidenceBackfillResult]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     status_file.parent.mkdir(parents=True, exist_ok=True)
     write_evidence_status(
         status_file,
@@ -213,6 +222,7 @@ def auto_backfill_local_evidence(
             "limit": limit,
             "wiki": wiki,
             "output_dir": str(output_dir),
+            "checkpoint_dir": str(checkpoint_dir),
             "include_talk": include_talk,
         },
     )
@@ -222,7 +232,6 @@ def auto_backfill_local_evidence(
         snapshot = snapshot_from_period(period)
         if not snapshot:
             raise ValueError(f"Cannot determine snapshot from period: {period}")
-        candidates = evidence_inputs_from_rows(candidate_rows_for_period(period, limit), period, wiki)
         write_evidence_status(
             status_file,
             {
@@ -232,23 +241,41 @@ def auto_backfill_local_evidence(
                 "periods_total": len(periods),
                 "periods_done": period_index - 1,
                 "current_period": period,
-                "candidates_total": len(candidates),
                 "limit": limit,
                 "wiki": wiki,
                 "include_talk": include_talk,
             },
         )
+        candidates = evidence_inputs_from_rows(candidate_rows_for_period(period, limit), period, wiki)
 
-        talk_page_ids = (
-            talk_page_ids_from_history_dumps(
-                candidates,
-                period=period,
-                wiki=wiki,
-                history_dump_dir=history_dump_dir,
+        status_base = {
+            "status": "running",
+            "periods": periods,
+            "periods_total": len(periods),
+            "periods_done": period_index - 1,
+            "current_period": period,
+            "candidates_total": len(candidates),
+            "limit": limit,
+            "wiki": wiki,
+            "include_talk": include_talk,
+        }
+        if include_talk:
+            write_evidence_status(status_file, {**status_base, "phase": "resolving_talk_pages"})
+        talk_page_ids = candidate_talk_page_ids(candidates) if include_talk else {}
+        missing_talk_candidates = [
+            candidate for candidate in candidates if candidate.page_id not in talk_page_ids
+        ]
+        if include_talk and missing_talk_candidates:
+            talk_page_ids.update(
+                talk_page_ids_from_history_dumps(
+                    missing_talk_candidates,
+                    period=period,
+                    wiki=wiki,
+                    history_dump_dir=history_dump_dir,
+                    status_file=status_file,
+                    status={**status_base, "phase": "resolving_talk_pages"},
+                )
             )
-            if include_talk
-            else {}
-        )
         target_page_ids = {candidate.page_id for candidate in candidates}
         target_page_ids.update(talk_page_ids.values())
         shards = revision_shards_for_page_ids(
@@ -361,6 +388,12 @@ def auto_backfill_local_evidence(
                 "wiki": wiki,
                 "include_talk": include_talk,
             },
+            checkpoint_dir=prepare_period_checkpoint_dir(
+                checkpoint_dir,
+                wiki=wiki,
+                period=period,
+                reset=reset_checkpoints,
+            ),
         )
         results.append(result)
         write_evidence_status(
@@ -563,17 +596,37 @@ def talk_page_ids_from_history_dumps(
     period: str,
     wiki: str,
     history_dump_dir: Path,
+    status_file: Path | None = None,
+    status: dict[str, Any] | None = None,
 ) -> dict[int, int]:
     candidate_by_title = {normalize_title(candidate.page_title): candidate for candidate in candidates}
     if not candidate_by_title:
         return {}
     paths = history_dump_paths_for_period(period=period, wiki=wiki, history_dump_dir=history_dump_dir)
     result: dict[int, int] = {}
-    for path in paths:
+    for path_index, path in enumerate(paths, start=1):
         if not path.exists():
             continue
+        rows_seen = 0
+        last_status_at = 0.0
         with bz2.open(path, "rt", encoding="utf-8", newline="") as file:
             for line in file:
+                rows_seen += 1
+                now = time.monotonic()
+                if status_file and status and now - last_status_at >= 5:
+                    last_status_at = now
+                    write_evidence_status(
+                        status_file,
+                        {
+                            **status,
+                            "phase": "resolving_talk_pages",
+                            "history_dumps_done": path_index - 1,
+                            "history_dumps_total": len(paths),
+                            "current_history_dump": path.name,
+                            "current_history_rows_seen": rows_seen,
+                            "talk_pages_found": len(result),
+                        },
+                    )
                 revision = parse_history_row(line.rstrip("\n").split("\t"), namespace=1)
                 if revision is None:
                     continue
@@ -583,7 +636,28 @@ def talk_page_ids_from_history_dumps(
                 result.setdefault(candidate.page_id, revision.page_id)
                 if len(result) == len(candidate_by_title):
                     return result
+        if status_file and status:
+            write_evidence_status(
+                status_file,
+                {
+                    **status,
+                    "phase": "resolving_talk_pages",
+                    "history_dumps_done": path_index,
+                    "history_dumps_total": len(paths),
+                    "current_history_dump": path.name,
+                    "current_history_rows_seen": rows_seen,
+                    "talk_pages_found": len(result),
+                },
+            )
     return result
+
+
+def candidate_talk_page_ids(candidates: list[CandidateEvidenceInput]) -> dict[int, int]:
+    return {
+        candidate.page_id: int(candidate.talk_page_id)
+        for candidate in candidates
+        if candidate.talk_page_id
+    }
 
 
 def history_dump_paths_for_period(*, period: str, wiki: str, history_dump_dir: Path) -> list[Path]:
@@ -628,6 +702,75 @@ def read_evidence_status(status_file: Path = DEFAULT_EVIDENCE_STATUS_FILE) -> di
         }
 
 
+def prepare_period_checkpoint_dir(
+    checkpoint_root: Path,
+    *,
+    wiki: str,
+    period: str,
+    reset: bool = False,
+) -> Path:
+    path = checkpoint_root / safe_path_part(wiki) / safe_path_part(period)
+    if reset and path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def shard_checkpoint_path(checkpoint_dir: Path, dump_path: Path) -> Path:
+    return checkpoint_dir / f"{safe_path_part(dump_path.name)}.json"
+
+
+def safe_path_part(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value)
+
+
+def load_shard_checkpoint(path: Path) -> CollectedEvidenceRevisions | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    collected = CollectedEvidenceRevisions()
+    collected.articles = {
+        int(page_id): list(revisions)
+        for page_id, revisions in (payload.get("articles") or {}).items()
+    }
+    collected.talks = {
+        int(page_id): list(revisions)
+        for page_id, revisions in (payload.get("talks") or {}).items()
+    }
+    return collected
+
+
+def write_shard_checkpoint(path: Path, collected: CollectedEvidenceRevisions) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "articles": {
+            str(page_id): revisions
+            for page_id, revisions in sorted(collected.articles.items())
+        },
+        "talks": {
+            str(page_id): revisions
+            for page_id, revisions in sorted(collected.talks.items())
+        },
+        "written_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload), encoding="utf-8")
+    temporary.replace(path)
+
+
+def merge_collected_revisions(
+    target: CollectedEvidenceRevisions,
+    source: CollectedEvidenceRevisions,
+) -> None:
+    for page_id, revisions in source.articles.items():
+        target.articles.setdefault(page_id, []).extend(revisions)
+    for page_id, revisions in source.talks.items():
+        target.talks.setdefault(page_id, []).extend(revisions)
+
+
 def collect_revisions_from_xml_dumps(
     dump_paths: list[Path],
     candidates: list[CandidateEvidenceInput],
@@ -635,6 +778,7 @@ def collect_revisions_from_xml_dumps(
     *,
     status_file: Path | None = None,
     status: dict[str, Any] | None = None,
+    checkpoint_dir: Path | None = None,
 ) -> CollectedEvidenceRevisions:
     start, end = period_bounds(period)
     if start is None or end is None:
@@ -646,46 +790,92 @@ def collect_revisions_from_xml_dumps(
         normalize_title(f"Talk:{candidate.page_title.replace('_', ' ')}"): candidate
         for candidate in candidates
     }
+    candidates_by_talk_id = {
+        int(candidate.talk_page_id): candidate
+        for candidate in candidates
+        if candidate.talk_page_id
+    }
     collected = CollectedEvidenceRevisions()
+    checkpoint_shards_reused = 0
+    checkpoint_shards_written = 0
     for path_index, path in enumerate(dump_paths, start=1):
-        pages_seen = 0
-        last_status_at = 0.0
-        for page in iter_mediawiki_xml_pages(path):
-            pages_seen += 1
-            now = time.monotonic()
-            if status_file and status and now - last_status_at >= 5:
-                last_status_at = now
+        checkpoint_path = shard_checkpoint_path(checkpoint_dir, path) if checkpoint_dir else None
+        checkpoint = load_shard_checkpoint(checkpoint_path) if checkpoint_path else None
+        if checkpoint is not None:
+            checkpoint_shards_reused += 1
+            merge_collected_revisions(collected, checkpoint)
+            if status_file and status:
                 write_evidence_status(
                     status_file,
                     {
                         **status,
                         "phase": "parsing_shards",
-                        "parse_shards_done": path_index - 1,
+                        "parse_shards_done": path_index,
                         "parse_shards_total": len(dump_paths),
                         "current_parse_shard": path.name,
-                        "current_parse_pages_seen": pages_seen,
+                        "current_parse_pages_seen": 0,
+                        "current_parse_revisions_seen": 0,
                         "article_pages_found": len(collected.articles),
                         "talk_pages_found_in_xml": len(collected.talks),
+                        "checkpoint_shards_reused": checkpoint_shards_reused,
+                        "checkpoint_shards_written": checkpoint_shards_written,
                     },
                 )
-            title = str(page.get("title") or "")
+            continue
+
+        shard_collected = CollectedEvidenceRevisions()
+        pages_seen = 0
+        last_status_at = 0.0
+
+        revisions_seen = 0
+
+        def report_parse_progress(scanned_pages: int, scanned_revisions: int) -> None:
+            nonlocal pages_seen, revisions_seen, last_status_at
+            pages_seen = scanned_pages
+            revisions_seen = scanned_revisions
+            now = time.monotonic()
+            if not status_file or not status or now - last_status_at < 5:
+                return
+            last_status_at = now
+            write_evidence_status(
+                status_file,
+                {
+                    **status,
+                    "phase": "parsing_shards",
+                    "parse_shards_done": path_index - 1,
+                    "parse_shards_total": len(dump_paths),
+                    "current_parse_shard": path.name,
+                    "current_parse_pages_seen": pages_seen,
+                    "current_parse_revisions_seen": revisions_seen,
+                    "article_pages_found": len(collected.articles) + len(shard_collected.articles),
+                    "talk_pages_found_in_xml": len(collected.talks) + len(shard_collected.talks),
+                    "checkpoint_shards_reused": checkpoint_shards_reused,
+                    "checkpoint_shards_written": checkpoint_shards_written,
+                },
+            )
+
+        for page in iter_target_mediawiki_xml_pages(
+            path,
+            candidates_by_id=candidates_by_id,
+            candidates_by_title=candidates_by_title,
+            candidates_by_talk_title=candidates_by_talk_title,
+            candidates_by_talk_id=candidates_by_talk_id,
+            progress_callback=report_parse_progress,
+        ):
             namespace = int(page.get("namespace") or 0)
-            page_id = int(page.get("page_id") or 0)
-            normalized_title = normalize_title(title)
+            candidate = page["candidate"]
             if namespace == 0:
-                candidate = candidates_by_id.get(page_id) or candidates_by_title.get(normalized_title)
-                if not candidate:
-                    continue
                 revisions = revisions_in_period(page.get("revisions") or [], start, end)
                 if revisions:
-                    collected.articles.setdefault(candidate.page_id, []).extend(revisions)
+                    shard_collected.articles.setdefault(candidate.page_id, []).extend(revisions)
             elif namespace == 1:
-                candidate = candidates_by_talk_title.get(normalized_title)
-                if not candidate:
-                    continue
                 revisions = revisions_in_period(page.get("revisions") or [], start, end)
                 if revisions:
-                    collected.talks.setdefault(candidate.page_id, []).extend(revisions)
+                    shard_collected.talks.setdefault(candidate.page_id, []).extend(revisions)
+        merge_collected_revisions(collected, shard_collected)
+        if checkpoint_path:
+            write_shard_checkpoint(checkpoint_path, shard_collected)
+            checkpoint_shards_written += 1
         if status_file and status:
             write_evidence_status(
                 status_file,
@@ -696,8 +886,11 @@ def collect_revisions_from_xml_dumps(
                     "parse_shards_total": len(dump_paths),
                     "current_parse_shard": path.name,
                     "current_parse_pages_seen": pages_seen,
+                    "current_parse_revisions_seen": revisions_seen,
                     "article_pages_found": len(collected.articles),
                     "talk_pages_found_in_xml": len(collected.talks),
+                    "checkpoint_shards_reused": checkpoint_shards_reused,
+                    "checkpoint_shards_written": checkpoint_shards_written,
                 },
             )
     for revisions in collected.articles.values():
@@ -705,6 +898,90 @@ def collect_revisions_from_xml_dumps(
     for revisions in collected.talks.values():
         revisions.sort(key=lambda item: (str(item.get("timestamp") or ""), int(item.get("rev_id") or 0)))
     return collected
+
+
+def iter_target_mediawiki_xml_pages(
+    path: Path,
+    *,
+    candidates_by_id: dict[int, CandidateEvidenceInput],
+    candidates_by_title: dict[str, CandidateEvidenceInput],
+    candidates_by_talk_title: dict[str, CandidateEvidenceInput],
+    candidates_by_talk_id: dict[int, CandidateEvidenceInput] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> Iterable[dict[str, Any]]:
+    with open_dump_text(path) as file:
+        context = ElementTree.iterparse(file, events=("start", "end"))
+        stack: list[str] = []
+        pages_seen = 0
+        revisions_seen = 0
+        current: dict[str, Any] | None = None
+
+        def resolve_current_candidate() -> CandidateEvidenceInput | None:
+            if current is None:
+                return None
+            candidate = current.get("candidate")
+            if candidate:
+                return candidate
+            namespace = int(current.get("namespace") or 0)
+            page_id = int(current.get("page_id") or 0)
+            normalized_title = normalize_title(str(current.get("title") or ""))
+            if namespace == 0:
+                candidate = candidates_by_id.get(page_id) or candidates_by_title.get(normalized_title)
+            elif namespace == 1:
+                candidate = (candidates_by_talk_id or {}).get(page_id) or candidates_by_talk_title.get(normalized_title)
+            if candidate:
+                current["candidate"] = candidate
+            return candidate
+
+        for event, element in context:
+            name = local_name(element.tag)
+            if event == "start":
+                stack.append(name)
+                if name == "page":
+                    current = {
+                        "title": "",
+                        "namespace": 0,
+                        "page_id": 0,
+                        "candidate": None,
+                        "revisions": [],
+                    }
+                continue
+
+            parent = stack[-2] if len(stack) >= 2 else ""
+            if current is not None:
+                if name == "title" and parent == "page":
+                    current["title"] = element.text or ""
+                    resolve_current_candidate()
+                elif name == "ns" and parent == "page":
+                    current["namespace"] = int(element.text or 0)
+                    resolve_current_candidate()
+                elif name == "id" and parent == "page" and not current.get("page_id"):
+                    current["page_id"] = int(element.text or 0)
+                    resolve_current_candidate()
+                elif name == "revision":
+                    revisions_seen += 1
+                    if resolve_current_candidate():
+                        current["revisions"].append(parse_revision_element(element))
+                    element.clear()
+                    if progress_callback:
+                        progress_callback(pages_seen, revisions_seen)
+                elif name == "page":
+                    pages_seen += 1
+                    candidate = resolve_current_candidate()
+                    if progress_callback:
+                        progress_callback(pages_seen, revisions_seen)
+                    if candidate:
+                        yield {
+                            "title": current.get("title") or "",
+                            "namespace": int(current.get("namespace") or 0),
+                            "page_id": int(current.get("page_id") or 0),
+                            "candidate": candidate,
+                            "revisions": list(current.get("revisions") or []),
+                        }
+                    element.clear()
+                    current = None
+            if stack:
+                stack.pop()
 
 
 def iter_mediawiki_xml_pages(path: Path) -> Iterable[dict[str, Any]]:
@@ -717,11 +994,10 @@ def iter_mediawiki_xml_pages(path: Path) -> Iterable[dict[str, Any]]:
             element.clear()
 
 
-def parse_page_element(element: ElementTree.Element) -> dict[str, Any]:
+def page_element_identity(element: ElementTree.Element) -> tuple[str, int, int]:
     title = ""
     namespace = 0
     page_id = 0
-    revisions: list[dict[str, Any]] = []
     for child in element:
         name = local_name(child.tag)
         if name == "title":
@@ -730,14 +1006,26 @@ def parse_page_element(element: ElementTree.Element) -> dict[str, Any]:
             namespace = int(child.text or 0)
         elif name == "id" and not page_id:
             page_id = int(child.text or 0)
-        elif name == "revision":
-            revisions.append(parse_revision_element(child))
+    return title, namespace, page_id
+
+
+def parse_page_element(element: ElementTree.Element) -> dict[str, Any]:
+    title, namespace, page_id = page_element_identity(element)
     return {
         "title": title,
         "namespace": namespace,
         "page_id": page_id,
-        "revisions": revisions,
+        "revisions": parse_page_revisions(element),
     }
+
+
+def parse_page_revisions(element: ElementTree.Element) -> list[dict[str, Any]]:
+    revisions: list[dict[str, Any]] = []
+    for child in element:
+        name = local_name(child.tag)
+        if name == "revision":
+            revisions.append(parse_revision_element(child))
+    return revisions
 
 
 def parse_revision_element(element: ElementTree.Element) -> dict[str, Any]:
@@ -818,6 +1106,12 @@ def main() -> None:
     backfill_parser.add_argument("--period", required=True)
     backfill_parser.add_argument("--wiki", default=settings.wiki_db)
     backfill_parser.add_argument("--limit", type=int, default=100)
+    backfill_parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_EVIDENCE_CHECKPOINT_DIR)
+    backfill_parser.add_argument(
+        "--reset-checkpoints",
+        action="store_true",
+        help="Delete saved evidence checkpoints for this period before parsing.",
+    )
     backfill_parser.add_argument(
         "--dump",
         dest="dumps",
@@ -841,12 +1135,18 @@ def main() -> None:
     auto_parser.add_argument("--wiki", default=settings.wiki_db)
     auto_parser.add_argument("--limit", type=int, default=20)
     auto_parser.add_argument("--output-dir", type=Path, default=DEFAULT_EVIDENCE_DUMP_DIR)
+    auto_parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_EVIDENCE_CHECKPOINT_DIR)
     auto_parser.add_argument("--history-dump-dir", type=Path, default=Path("data/dumps"))
     auto_parser.add_argument("--status-file", type=Path, default=DEFAULT_EVIDENCE_STATUS_FILE)
     auto_parser.add_argument(
         "--include-talk",
         action="store_true",
         help="Also scan local mediawiki_history TSVs for talk-page IDs and download their XML shards.",
+    )
+    auto_parser.add_argument(
+        "--reset-checkpoints",
+        action="store_true",
+        help="Delete saved evidence checkpoints for each period before parsing.",
     )
 
     status_parser = subparsers.add_parser("status", help="Print the latest evidence backfill status JSON.")
@@ -859,6 +1159,12 @@ def main() -> None:
             dump_paths=args.dumps,
             wiki=args.wiki,
             limit=args.limit,
+            checkpoint_dir=prepare_period_checkpoint_dir(
+                args.checkpoint_dir,
+                wiki=args.wiki,
+                period=args.period,
+                reset=args.reset_checkpoints,
+            ),
         )
         print(
             "period={period} candidates={candidates} pages_with_article_revisions={pages_with_article_revisions} "
@@ -870,9 +1176,11 @@ def main() -> None:
             wiki=args.wiki,
             limit=args.limit,
             output_dir=args.output_dir,
+            checkpoint_dir=args.checkpoint_dir,
             history_dump_dir=args.history_dump_dir,
             status_file=args.status_file,
             include_talk=args.include_talk,
+            reset_checkpoints=args.reset_checkpoints,
         )
         for result in results:
             print(

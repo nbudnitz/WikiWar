@@ -374,6 +374,18 @@ async function toggleScoreboardSegments(rowElement, row, isHistorical, selectedP
   rowElement.classList.add("is-selected");
   const detailRow = document.createElement("tr");
   detailRow.className = "scoreboard-detail-row";
+  if (isHistorical && row.ranking_method === "governance") {
+    detailRow.innerHTML = `
+      <td colspan="${scoreboardColumnCount(isHistorical)}">
+        <div class="scoreboard-detail">
+          ${renderGovernancePanel(row)}
+        </div>
+      </td>
+    `;
+    rowElement.after(detailRow);
+    return;
+  }
+
   detailRow.innerHTML = `
     <td colspan="${scoreboardColumnCount(isHistorical)}">
       <div class="scoreboard-detail">
@@ -405,6 +417,126 @@ async function toggleScoreboardSegments(rowElement, row, isHistorical, selectedP
   }
 }
 
+function renderGovernancePanel(row) {
+  const rfcCount = Number(row.talk_rfc_count || 0);
+  const arbitrationCount = Number(row.talk_arbitration_count || 0);
+  const talkRestrictionCount = Number(row.talk_restriction_count || 0);
+  const restrictionCount = Number(row.restriction_count || 0);
+  const protectionEvents = Number(row.protection_event_count || 0);
+  const protectionDays = Number(row.protection_days || 0);
+  const restrictionTypes = splitList(row.restriction_types);
+  const restrictionLevels = splitList(row.restriction_levels);
+  const adminActionKinds = new Set([
+    ...restrictionTypes,
+    ...restrictionLevels,
+    ...(protectionEvents ? ["protect log"] : []),
+    ...(arbitrationCount ? ["arbitration"] : []),
+    ...(talkRestrictionCount ? ["restriction discussion"] : []),
+  ]);
+  const isCurrentlyProtected = restrictionCount > 0 || row.has_extendedconfirmed || row.has_sysop || row.has_cascade;
+  const protectionSummary = protectionStateLabel(row, isCurrentlyProtected);
+  const protectionDetails = [
+    protectionDays ? `${formatDurationDays(protectionDays)} protected` : "",
+    protectionEvents ? `${fmt.format(protectionEvents)} log action${protectionEvents === 1 ? "" : "s"}` : "",
+    formatRestrictionExpiry(row.restriction_expiry) !== "--" ? `expires ${formatRestrictionExpiry(row.restriction_expiry)}` : "",
+  ].filter(Boolean).join(" · ") || "No protection duration stored";
+  return `
+    <h3>Governance Actions</h3>
+    <div class="governance-panel">
+      <section class="governance-section">
+        <h4>Talk</h4>
+        <div class="governance-metric-grid">
+          ${governanceMetricHtml("Talk edits", fmt.format(Number(row.talk_edit_count || 0)))}
+          ${governanceMetricHtml("Talk editors", fmt.format(Number(row.talk_unique_editors || 0)))}
+        </div>
+      </section>
+      <section class="governance-section">
+        <h4>Dispute Resolution</h4>
+        <div class="governance-metric-grid">
+          ${governanceMetricHtml("Requests for comment", fmt.format(rfcCount))}
+          ${governanceMetricHtml("Arbitration signals", fmt.format(arbitrationCount))}
+          ${governanceMetricHtml("Restriction discussions", fmt.format(talkRestrictionCount))}
+        </div>
+      </section>
+      <section class="governance-section">
+        <h4>Administrator Actions</h4>
+        <div class="governance-metric-grid">
+          ${governanceMetricHtml("Different signals", fmt.format(adminActionKinds.size))}
+          ${governanceMetricHtml("Protection log actions", fmt.format(protectionEvents))}
+          ${governanceMetricHtml("Current restrictions", fmt.format(restrictionCount))}
+        </div>
+        ${governanceTagListHtml("Restriction types", restrictionTypes)}
+        ${governanceTagListHtml("Protection levels", restrictionLevels.map(protectionLevelLabel))}
+      </section>
+      <p class="governance-protection-line">
+        <span>Protection</span>
+        <strong>${escapeHtml(protectionSummary)}</strong>
+        <em>${escapeHtml(protectionDetails)}</em>
+      </p>
+    </div>
+  `;
+}
+
+function governanceMetricHtml(label, value, note = "") {
+  return `
+    <div class="governance-metric">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(String(value))}</strong>
+      ${note ? `<em>${escapeHtml(note)}</em>` : ""}
+    </div>
+  `;
+}
+
+function governanceTagListHtml(label, values) {
+  if (!values.length) return "";
+  return `
+    <div class="governance-tags" aria-label="${escapeHtml(label)}">
+      <span>${escapeHtml(label)}</span>
+      ${values.map((value) => `<b>${escapeHtml(value)}</b>`).join("")}
+    </div>
+  `;
+}
+
+function splitList(value) {
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function protectionLevelLabel(value) {
+  const normalized = String(value || "").toLowerCase().replace(/[-_\s]/g, "");
+  if (normalized === "sysop") return "full protection";
+  if (normalized === "autoconfirmed") return "semi-protection";
+  if (normalized === "extendedconfirmed") return "extended confirmed protection";
+  if (normalized === "templateeditor") return "template protection";
+  return value;
+}
+
+function protectionStateLabel(row, isCurrentlyProtected) {
+  if (!isCurrentlyProtected) return "not currently protected";
+  const levels = splitList(row.restriction_levels).map(protectionLevelLabel);
+  if (row.has_cascade) levels.push("cascading protection");
+  if (!levels.length) return "currently protected";
+  return levels.join(", ");
+}
+
+function formatRestrictionExpiry(value) {
+  const expiry = String(value || "").trim();
+  if (!expiry) return "--";
+  if (expiry.toLowerCase() === "infinity") return "indefinite";
+  if (/^\d{14}$/.test(expiry)) {
+    return `${expiry.slice(0, 4)}-${expiry.slice(4, 6)}-${expiry.slice(6, 8)}`;
+  }
+  return expiry;
+}
+
+function formatDurationDays(days) {
+  if (days >= 365) return `${fmt.format(days / 365)} years`;
+  if (days >= 1) return `${fmt.format(days)} days`;
+  return `${fmt.format(days * 24)} hours`;
+}
+
 function renderScoreboardSegments(payload) {
   const segments = payload.segments || [];
   const evidenceHtml = controversyEvidenceHtml(payload.controversy);
@@ -412,6 +544,7 @@ function renderScoreboardSegments(payload) {
     return `
       <h3>Battles</h3>
       <p class="muted">${escapeHtml(payload.message || "Local historical battle evidence has not been backfilled for this page and period yet.")}</p>
+      ${evidenceBackfillStatusHtml(payload.evidence_status)}
     `;
   }
   if (!segments.length) {
@@ -433,6 +566,41 @@ function renderScoreboardSegments(payload) {
       `).join("")}
     </div>
   `;
+}
+
+function evidenceBackfillStatusHtml(status) {
+  if (!status || status.status !== "running") return "";
+  const phase = humanEvidencePhase(status.phase);
+  const pieces = [
+    phase,
+    status.current_period ? `period ${status.current_period}` : "",
+    status.history_dumps_total ? `history dumps ${fmt.format(status.history_dumps_done || 0)} of ${fmt.format(status.history_dumps_total)}` : "",
+    status.parse_shards_total ? `parsed ${fmt.format(status.parse_shards_done || 0)} of ${fmt.format(status.parse_shards_total)} shards` : "",
+    status.article_pages_found != null ? `${fmt.format(status.article_pages_found)} article pages found` : "",
+    status.talk_pages_found_in_xml != null ? `${fmt.format(status.talk_pages_found_in_xml)} talk pages found` : "",
+    status.pages_written != null ? `${fmt.format(status.pages_written)} pages cached` : "",
+  ].filter(Boolean);
+  return `
+    <div class="evidence-backfill-status">
+      <span>Backfill status</span>
+      <strong>${escapeHtml(pieces.join(" · "))}</strong>
+    </div>
+  `;
+}
+
+function humanEvidencePhase(phase) {
+  const labels = {
+    starting: "Starting",
+    resolving_candidates: "Resolving candidates",
+    resolving_talk_pages: "Resolving talk pages",
+    downloading_shards: "Downloading XML shards",
+    parsing_shards: "Parsing XML shards",
+    writing_cache: "Writing evidence cache",
+    period_done: "Period complete",
+    complete: "Complete",
+    stopped: "Stopped",
+  };
+  return labels[phase] || String(phase || "Running");
 }
 
 function segmentLineHtml(segment, options = {}) {

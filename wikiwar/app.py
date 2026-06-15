@@ -162,11 +162,23 @@ def scoreboard_segments(
             if cached:
                 return serialize(cached["payload"])
             if not allow_api_fallback:
+                evidence_status = read_evidence_status()
+                current_period = evidence_status.get("current_period")
+                status = evidence_status.get("status")
+                phase = evidence_status.get("phase")
+                if status == "running" and current_period == period:
+                    message = "Local historical evidence is still being backfilled for this period."
+                elif status == "complete":
+                    message = "Local historical evidence backfill has completed, but this page has no cached battle evidence for this period."
+                else:
+                    message = "Local historical evidence has not been backfilled for this page and period yet."
                 return {
                     "source": "local_evidence_missing",
                     "revision_count": 0,
                     "segments": [],
-                    "message": "Local historical evidence has not been backfilled for this page and period yet.",
+                    "message": message,
+                    "evidence_status": evidence_status,
+                    "evidence_phase": phase,
                 }
         payload = fetch_revision_segments(
             wiki=wiki,
